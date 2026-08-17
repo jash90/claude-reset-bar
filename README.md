@@ -12,7 +12,10 @@ A menu bar / system tray icon that shows your Claude usage limits and **notifies
 ● you@example.com
    5h  ■■■■■□□□□□□□  39%   resets in 15m (Mon 11:29)
    7d  ■■■□□□□□□□□□  23%   resets in 5d 13h (Sun 00:59)
+   7d  ■□□□□□□□□□□□  4%    Opus only
 ```
+
+A third kind of row shows up when your plan caps a single model separately — `Opus only`, `Fable only`, whatever the API reports. Those come from the scoped weekly entries, so a new model tier appears without the app needing a change. If your account has no per-model cap, the row is simply absent.
 
 Each window carries a fill gauge alongside the number, so you can judge how much is left without reading digits, and compare accounts at a glance. Any usage at all lights the first cell, so "barely used" never looks like "untouched".
 

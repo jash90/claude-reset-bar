@@ -35,7 +35,23 @@ struct UsageWindow: Codable {
 struct UsageLimit: Codable {
     let group: String?
     let kind: String?
+    let percent: Double?
     let is_active: Bool?
+    /// Set on a "weekly_scoped" entry: the weekly cap that applies to one model only.
+    /// This is where per-model limits are reported now; the seven_day_opus and
+    /// seven_day_sonnet fields come back null.
+    let scope: Scope?
+
+    struct Scope: Codable {
+        let model: Model?
+        struct Model: Codable { let display_name: String? }
+    }
+}
+
+/// A weekly cap that applies to a single model.
+struct ModelWindow {
+    let label: String
+    let pct: Double
 }
 
 struct UsageResponse: Codable {
@@ -52,8 +68,7 @@ struct Reading {
     var sevenDayPct: Double
     var fiveHourResetsAt: Date
     var sevenDayResetsAt: Date
-    var opusPct: Double?
-    var sonnetPct: Double?
+    var models: [ModelWindow] = []
     var active: Bool
     var error: String?
     /// nil for a live account. Set when the account can no longer be polled — Claude Code
@@ -156,6 +171,26 @@ func discoverOrgId(sessionKey: String, completion: @escaping (Result<String, Err
             return .success(uuid)
         })
     }
+}
+
+/// Per-model weekly caps arrive two ways depending on the account. The dedicated fields are
+/// the older shape and now usually null; the scoped entries in `limits` are the current one,
+/// and reading them means new model tiers appear without a code change.
+func modelWindows(_ usage: UsageResponse) -> [ModelWindow] {
+    var out: [ModelWindow] = []
+    var seen = Set<String>()
+
+    func add(_ label: String?, _ percent: Double?) {
+        guard let label, !label.isEmpty, let percent, seen.insert(label).inserted else { return }
+        out.append(ModelWindow(label: label, pct: percent))
+    }
+
+    add("Opus", usage.seven_day_opus?.utilization)
+    add("Sonnet", usage.seven_day_sonnet?.utilization)
+    for limit in usage.limits ?? [] where limit.group == "weekly" {
+        add(limit.scope?.model?.display_name, limit.percent)
+    }
+    return out.sorted { $0.label < $1.label }
 }
 
 func decodeUsage(_ result: Result<Data, Error>) -> Result<UsageResponse, Error> {
@@ -463,7 +498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var r = readings[name] ?? Reading(fiveHourPct: 0, sevenDayPct: 0,
                                               fiveHourResetsAt: .distantFuture,
                                               sevenDayResetsAt: .distantFuture,
-                                              opusPct: nil, sonnetPct: nil, active: false, error: nil, lastSeen: nil)
+                                              models: [], active: false, error: nil, lastSeen: nil)
             r.error = err.localizedDescription
             readings[name] = r
 
@@ -479,8 +514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 sevenDayPct: usage.seven_day.utilization,
                 fiveHourResetsAt: fiveReset,
                 sevenDayResetsAt: sevenReset,
-                opusPct: usage.seven_day_opus?.utilization,
-                sonnetPct: usage.seven_day_sonnet?.utilization,
+                models: modelWindows(usage),
                 active: session?.is_active ?? false,
                 error: nil,
                 lastSeen: nil)
@@ -556,8 +590,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 remaining(until: r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
                          String(format: T.sevenDayLine, bar(r.sevenDayPct), paddedPct(r.sevenDayPct),
                                 remaining(until: r.sevenDayResetsAt), clock(r.sevenDayResetsAt))]
-            if let o = r.opusPct { lines.append(String(format: T.opusLine, bar(o), pct(o))) }
-            if let s = r.sonnetPct { lines.append(String(format: T.sonnetLine, bar(s), pct(s))) }
+            for m in r.models {
+                lines.append(String(format: T.modelLine, bar(m.pct), paddedPct(m.pct), m.label))
+            }
             for line in lines { menu.addItem(disabled(line)) }
         }
 
@@ -752,6 +787,35 @@ func runSelfCheck() {
     assert(String(format: T.lastSeen, "12:03").contains("12:03"))
     assert(String(format: T.resetTitle, "acc").contains("acc"))
     assert(String(format: T.fiveHourLine, bar(30), "30% ", "2h 1m", "Mon 11:29").contains("30%"))
+
+    // Per-model weekly caps: read from the scoped entries in `limits`, which is where the
+    // API reports them now that seven_day_opus and seven_day_sonnet come back null.
+    let scopedJSON = """
+    {"five_hour":{"utilization":9,"resets_at":"2026-08-17T14:29:59Z"},
+     "seven_day":{"utilization":25,"resets_at":"2026-08-22T22:59:59Z"},
+     "limits":[{"kind":"session","group":"session","percent":9,"is_active":true},
+               {"kind":"weekly_all","group":"weekly","percent":25},
+               {"kind":"weekly_scoped","group":"weekly","percent":40,
+                "scope":{"model":{"display_name":"Opus"}}},
+               {"kind":"weekly_scoped","group":"weekly","percent":3,
+                "scope":{"model":{"display_name":"Fable"}}}]}
+    """
+    let scoped = try! JSONDecoder().decode(UsageResponse.self, from: scopedJSON.data(using: .utf8)!)
+    let models = modelWindows(scoped)
+    assert(models.count == 2, "both scoped models produce a row")
+    assert(models[0].label == "Fable" && models[1].label == "Opus",
+           "model rows keep a stable, sorted order")
+    assert(models[1].pct == 40, "the scoped percentage is carried through")
+    assert(scoped.limits?.first?.is_active == true, "the session entry still parses")
+
+    // An account reporting no per-model caps simply has no such rows.
+    let plainJSON = """
+    {"five_hour":{"utilization":9,"resets_at":"2026-08-17T14:29:59Z"},
+     "seven_day":{"utilization":25,"resets_at":"2026-08-22T22:59:59Z"},
+     "limits":[{"kind":"session","group":"session"}]}
+    """
+    let plain = try! JSONDecoder().decode(UsageResponse.self, from: plainJSON.data(using: .utf8)!)
+    assert(modelWindows(plain).isEmpty, "no scoped caps, no model rows")
 
     // The gauge must always occupy the same width, or the rows stop lining up.
     for v in [-5.0, 0, 0.4, 12.5, 50, 99.9, 100, 150] {

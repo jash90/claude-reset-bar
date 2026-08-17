@@ -24,8 +24,7 @@ type strings18n struct {
 
 	fiveHourLine string // "5h: <gauge> %s — resets in %s (%s)"
 	sevenDayLine string
-	opusLine     string
-	sonnetLine   string
+	modelLine    string // a weekly cap that applies to one model only
 
 	fiveHourWindow string
 	sevenDayWindow string
@@ -56,8 +55,7 @@ var languages = map[string]strings18n{
 
 		fiveHourLine: "   5h  %s  %-4s  resets in %s (%s)",
 		sevenDayLine: "   7d  %s  %-4s  resets in %s (%s)",
-		opusLine:     "   7d Opus    %s  %s",
-		sonnetLine:   "   7d Sonnet  %s  %s",
+		modelLine:    "   7d  %s  %-4s  %s only",
 
 		fiveHourWindow: "5-hour window",
 		sevenDayWindow: "7-day window",
@@ -87,8 +85,7 @@ var languages = map[string]strings18n{
 
 		fiveHourLine: "   5h  %s  %-4s  reset za %s (%s)",
 		sevenDayLine: "   7d  %s  %-4s  reset za %s (%s)",
-		opusLine:     "   7d Opus    %s  %s",
-		sonnetLine:   "   7d Sonnet  %s  %s",
+		modelLine:    "   7d  %s  %-4s  tylko %s",
 
 		fiveHourWindow: "okno 5-godzinne",
 		sevenDayWindow: "okno 7-dniowe",

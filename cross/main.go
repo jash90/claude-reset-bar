@@ -38,9 +38,24 @@ type UsageWindow struct {
 }
 
 type UsageLimit struct {
-	Kind     string `json:"kind"`
-	Group    string `json:"group"`
-	IsActive bool   `json:"is_active"`
+	Kind     string  `json:"kind"`
+	Group    string  `json:"group"`
+	Percent  float64 `json:"percent"`
+	IsActive bool    `json:"is_active"`
+	// Set on a "weekly_scoped" entry: the weekly cap that applies to one model only.
+	// This is where per-model limits are reported now; the seven_day_opus and
+	// seven_day_sonnet fields come back null.
+	Scope *struct {
+		Model *struct {
+			DisplayName string `json:"display_name"`
+		} `json:"model"`
+	} `json:"scope"`
+}
+
+// A weekly cap that applies to a single model.
+type modelWindow struct {
+	label string
+	pct   float64
 }
 
 type UsageResponse struct {
@@ -70,8 +85,7 @@ type reading struct {
 	sevenDayPct      float64
 	fiveHourResetsAt time.Time
 	sevenDayResetsAt time.Time
-	opusPct          *float64
-	sonnetPct        *float64
+	models           []modelWindow
 	active           bool
 	err              string
 	// lastSeen is zero for a live account. It is set when the account can no longer be
@@ -568,18 +582,32 @@ func toReading(name string, u UsageResponse, err error) reading {
 		fiveHourResetsAt: five,
 		sevenDayResetsAt: seven,
 	}
+	// Per-model weekly caps arrive two ways depending on the account. The dedicated
+	// fields are the older shape and now usually null; the scoped entries in limits[] are
+	// the current one, and reading them means new model tiers appear without a code change.
+	seen := map[string]bool{}
+	addModel := func(label string, percent float64) {
+		if label == "" || seen[label] {
+			return
+		}
+		seen[label] = true
+		r.models = append(r.models, modelWindow{label: label, pct: percent})
+	}
 	if u.SevenDayOpus != nil {
-		r.opusPct = &u.SevenDayOpus.Utilization
+		addModel("Opus", u.SevenDayOpus.Utilization)
 	}
 	if u.SevenDaySonnet != nil {
-		r.sonnetPct = &u.SevenDaySonnet.Utilization
+		addModel("Sonnet", u.SevenDaySonnet.Utilization)
 	}
 	for _, l := range u.Limits {
 		if l.Group == "session" || l.Kind == "session" {
 			r.active = l.IsActive
-			break
+		}
+		if l.Group == "weekly" && l.Scope != nil && l.Scope.Model != nil {
+			addModel(l.Scope.Model.DisplayName, l.Percent)
 		}
 	}
+	sort.Slice(r.models, func(i, j int) bool { return r.models[i].label < r.models[j].label })
 	return r
 }
 
@@ -784,11 +812,8 @@ func render() {
 				remainingUntil(r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
 			fmt.Sprintf(T().sevenDayLine, bar(r.sevenDayPct), pct(r.sevenDayPct),
 				remainingUntil(r.sevenDayResetsAt), clock(r.sevenDayResetsAt)))
-		if r.opusPct != nil {
-			lines = append(lines, fmt.Sprintf(T().opusLine, bar(*r.opusPct), pct(*r.opusPct)))
-		}
-		if r.sonnetPct != nil {
-			lines = append(lines, fmt.Sprintf(T().sonnetLine, bar(*r.sonnetPct), pct(*r.sonnetPct)))
+		for _, m := range r.models {
+			lines = append(lines, fmt.Sprintf(T().modelLine, bar(m.pct), pct(m.pct), m.label))
 		}
 		// The menu bar figure describes what you can still use right now, so a snapshot
 		// of an unreachable account must not drive it.
@@ -916,6 +941,20 @@ func assert(cond bool, what string) {
 	}
 }
 
+// mustScoped builds a weekly limit scoped to one model, for the self-check.
+func mustScoped(model string, percent float64) UsageLimit {
+	l := UsageLimit{Kind: "weekly_scoped", Group: "weekly", Percent: percent}
+	l.Scope = new(struct {
+		Model *struct {
+			DisplayName string `json:"display_name"`
+		} `json:"model"`
+	})
+	l.Scope.Model = &struct {
+		DisplayName string `json:"display_name"`
+	}{DisplayName: model}
+	return l
+}
+
 func runSelfCheck() {
 	now := time.Now()
 	plus5h := now.Add(5 * time.Hour)
@@ -1032,6 +1071,41 @@ func runSelfCheck() {
 	assert(tokenFromJSON([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}`)) == "sk-ant-oat01-x",
 		"the token is read from JSON")
 	assert(tokenFromJSON([]byte(`{"mcpOAuth":{}}`)) == "", "no token when the section is missing")
+
+	// Per-model weekly caps: read from the scoped entries in limits[], which is where the
+	// API reports them now that seven_day_opus and seven_day_sonnet come back null.
+	scoped := UsageResponse{
+		FiveHour: UsageWindow{Utilization: 9, ResetsAt: "2026-08-17T14:29:59Z"},
+		SevenDay: UsageWindow{Utilization: 25, ResetsAt: "2026-08-22T22:59:59Z"},
+		Limits: []UsageLimit{
+			{Kind: "session", Group: "session", Percent: 9, IsActive: true},
+			{Kind: "weekly_all", Group: "weekly", Percent: 25},
+		},
+	}
+	scoped.Limits = append(scoped.Limits, mustScoped("Fable", 3), mustScoped("Opus", 40))
+	got := toReading("acc", scoped, nil)
+	assert(got.err == "", "a scoped payload decodes")
+	assert(got.active, "the session entry still sets the active flag")
+	assert(len(got.models) == 2, "both scoped models produce a row")
+	assert(got.models[0].label == "Fable" && got.models[1].label == "Opus",
+		"model rows keep a stable, sorted order")
+	assert(got.models[1].pct == 40, "the scoped percentage is carried through")
+
+	// The legacy fields still work, and must not duplicate a scoped entry of the same name.
+	legacy := scoped
+	opus := UsageWindow{Utilization: 77}
+	legacy.SevenDayOpus = &opus
+	dedup := toReading("acc", legacy, nil)
+	assert(len(dedup.models) == 2, "a model reported twice yields one row")
+	assert(dedup.models[1].label == "Opus" && dedup.models[1].pct == 77,
+		"the legacy field wins when both are present")
+
+	// An account reporting no per-model caps simply has no such rows.
+	plain := toReading("acc", UsageResponse{
+		FiveHour: scoped.FiveHour, SevenDay: scoped.SevenDay,
+		Limits: []UsageLimit{{Kind: "session", Group: "session"}},
+	}, nil)
+	assert(len(plain.models) == 0, "no scoped caps, no model rows")
 
 	// The gauge must always occupy the same width, or the rows stop lining up.
 	for _, v := range []float64{-5, 0, 0.4, 12.5, 50, 99.9, 100, 150} {
