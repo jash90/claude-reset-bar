@@ -22,7 +22,7 @@ type strings18n struct {
 	lastSeen    string // " · last seen %s", appended to an unreachable account's name
 	days        [7]string
 
-	fiveHourLine string // "5h: %s — resets in %s (%s)"
+	fiveHourLine string // "5h: <gauge> %s — resets in %s (%s)"
 	sevenDayLine string
 	opusLine     string
 	sonnetLine   string
@@ -54,10 +54,10 @@ var languages = map[string]strings18n{
 		lastSeen:    "   · last seen %s",
 		days:        [7]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"},
 
-		fiveHourLine: "   5h: %s — resets in %s (%s)",
-		sevenDayLine: "   7d: %s — resets in %s (%s)",
-		opusLine:     "   7d Opus: %s",
-		sonnetLine:   "   7d Sonnet: %s",
+		fiveHourLine: "   5h  %s  %-4s  resets in %s (%s)",
+		sevenDayLine: "   7d  %s  %-4s  resets in %s (%s)",
+		opusLine:     "   7d Opus    %s  %s",
+		sonnetLine:   "   7d Sonnet  %s  %s",
 
 		fiveHourWindow: "5-hour window",
 		sevenDayWindow: "7-day window",
@@ -85,10 +85,10 @@ var languages = map[string]strings18n{
 		lastSeen:    "   · ostatnio widziane %s",
 		days:        [7]string{"niedz.", "pon.", "wt.", "śr.", "czw.", "pt.", "sob."},
 
-		fiveHourLine: "   5h: %s — reset za %s (%s)",
-		sevenDayLine: "   7d: %s — reset za %s (%s)",
-		opusLine:     "   7d Opus: %s",
-		sonnetLine:   "   7d Sonnet: %s",
+		fiveHourLine: "   5h  %s  %-4s  reset za %s (%s)",
+		sevenDayLine: "   7d  %s  %-4s  reset za %s (%s)",
+		opusLine:     "   7d Opus    %s  %s",
+		sonnetLine:   "   7d Sonnet  %s  %s",
 
 		fiveHourWindow: "okno 5-godzinne",
 		sevenDayWindow: "okno 7-dniowe",

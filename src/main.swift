@@ -282,6 +282,33 @@ func remaining(until date: Date) -> String {
 
 func pct(_ v: Double) -> String { "\(Int(v.rounded()))%" }
 
+/// Right-pads a percentage so the text after the gauge starts at the same offset.
+func paddedPct(_ v: Double) -> String {
+    let s = pct(v)
+    return s.count >= 4 ? s : s + String(repeating: " ", count: 4 - s.count)
+}
+
+// A gauge is easier to read at a glance than a number: you see how full the window is
+// without parsing digits, and several accounts line up for comparison.
+let barCells = 12
+
+// Filled and hollow squares rather than block-and-shade characters: at menu size the light
+// shade (U+2591) anti-aliases into a solid block, which made an almost-empty gauge look
+// full. These two stay distinguishable, and both are present in the default UI font on all
+// three platforms.
+let barFilled = "■"
+let barEmpty = "□"
+
+func bar(_ percent: Double) -> String {
+    let frac = min(max(percent / 100, 0), 1)
+    var full = Int((frac * Double(barCells)).rounded())
+    // Any usage at all lights the first cell, so "a little" never looks like "none".
+    if full == 0 && percent > 0 { full = 1 }
+
+    return String(repeating: barFilled, count: full)
+         + String(repeating: barEmpty, count: barCells - full)
+}
+
 /// A system notification. ponytail: osascript rather than UNUserNotificationCenter — it needs
 /// neither a signed bundle nor an authorization dialog. If the banner should carry its own
 /// icon instead of Script Editor's, that is the moment to switch.
@@ -525,12 +552,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 label += String(format: T.lastSeen, clockFormatter.string(from: seen))
             }
             var lines = ["\(r.active && r.lastSeen == nil ? "●" : "○") \(label)",
-                         String(format: T.fiveHourLine, pct(r.fiveHourPct),
+                         String(format: T.fiveHourLine, bar(r.fiveHourPct), paddedPct(r.fiveHourPct),
                                 remaining(until: r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
-                         String(format: T.sevenDayLine, pct(r.sevenDayPct),
+                         String(format: T.sevenDayLine, bar(r.sevenDayPct), paddedPct(r.sevenDayPct),
                                 remaining(until: r.sevenDayResetsAt), clock(r.sevenDayResetsAt))]
-            if let o = r.opusPct { lines.append(String(format: T.opusLine, pct(o))) }
-            if let s = r.sonnetPct { lines.append(String(format: T.sonnetLine, pct(s))) }
+            if let o = r.opusPct { lines.append(String(format: T.opusLine, bar(o), pct(o))) }
+            if let s = r.sonnetPct { lines.append(String(format: T.sonnetLine, bar(s), pct(s))) }
             for line in lines { menu.addItem(disabled(line)) }
         }
 
@@ -724,7 +751,21 @@ func runSelfCheck() {
     // Format strings must accept exactly the arguments the call sites pass.
     assert(String(format: T.lastSeen, "12:03").contains("12:03"))
     assert(String(format: T.resetTitle, "acc").contains("acc"))
-    assert(String(format: T.fiveHourLine, "30%", "2h 1m", "Mon 11:29").contains("30%"))
+    assert(String(format: T.fiveHourLine, bar(30), "30% ", "2h 1m", "Mon 11:29").contains("30%"))
+
+    // The gauge must always occupy the same width, or the rows stop lining up.
+    for v in [-5.0, 0, 0.4, 12.5, 50, 99.9, 100, 150] {
+        assert(bar(v).count == barCells, "gauge width at \(v)%")
+    }
+    assert(bar(0) == String(repeating: barEmpty, count: barCells))
+    assert(bar(100) == String(repeating: barFilled, count: barCells))
+    assert(bar(150) == bar(100), "over 100% cannot overflow the gauge")
+    assert(bar(-5) == bar(0), "a negative value cannot underflow the gauge")
+    assert(bar(50) == String(repeating: barFilled, count: barCells / 2)
+                    + String(repeating: barEmpty, count: barCells / 2))
+    // Barely-used must still differ from unused, or a low reading reads as zero.
+    assert(bar(1) != bar(0), "any usage lights the first cell")
+    assert(paddedPct(5).count == 4 && paddedPct(100).count == 4, "percentages align")
     assert(String(format: T.accountExists, "dup").contains("dup"))
 
     print("self-check OK")

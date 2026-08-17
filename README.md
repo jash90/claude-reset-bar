@@ -10,9 +10,11 @@ A menu bar / system tray icon that shows your Claude usage limits and **notifies
 
 ```
 ● you@example.com
-   5h: 39% — resets in 15m (Mon 11:29)
-   7d: 23% — resets in 5d 13h (Sun 00:59)
+   5h  ■■■■■□□□□□□□  39%   resets in 15m (Mon 11:29)
+   7d  ■■■□□□□□□□□□  23%   resets in 5d 13h (Sun 00:59)
 ```
+
+Each window carries a fill gauge alongside the number, so you can judge how much is left without reading digits, and compare accounts at a glance. Any usage at all lights the first cell, so "barely used" never looks like "untouched".
 
 ## Install
 
@@ -59,10 +61,10 @@ Rather than dropping its row, the app keeps the last reading it got, marked with
 
 ```
 ● new@example.com
-   5h: 2% — resets in 4h 47m (Mon 16:29)
+   5h  ■□□□□□□□□□□□  2%    resets in 4h 47m (Mon 16:29)
 
 ○ old@example.com   · last seen 12:03
-   5h: 40% — resets in 2h 14m (Mon 14:03)
+   5h  ■■■■■□□□□□□□  40%   resets in 2h 14m (Mon 14:03)
 ```
 
 The countdown on a snapshot row stays truthful, because `resets_at` does not move until the window actually resets — so you can still see when the other account frees up. Nothing refreshes it though, and no reset notification will arrive for it. Sign back into that account, or add it via `sessionKey`, and the row goes live again.

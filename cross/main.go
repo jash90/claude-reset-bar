@@ -139,6 +139,31 @@ func clock(t time.Time) string {
 
 func pct(v float64) string { return fmt.Sprintf("%d%%", int(math.Round(v))) }
 
+// A gauge is easier to read at a glance than a number: you see how full the window is
+// without parsing digits, and several accounts line up for comparison.
+const barCells = 12
+
+// Filled and hollow squares rather than block-and-shade characters: at menu size the light
+// shade (U+2591) anti-aliases into a solid block, which made an almost-empty gauge look
+// full. These two stay distinguishable, and both are present in the default UI font on all
+// three platforms.
+const (
+	barFilled = '■'
+	barEmpty  = '□'
+)
+
+func bar(percent float64) string {
+	frac := math.Max(0, math.Min(1, percent/100))
+	full := int(math.Round(frac * barCells))
+	// Any usage at all lights the first cell, so "a little" never looks like "none".
+	if full == 0 && percent > 0 {
+		full = 1
+	}
+
+	return strings.Repeat(string(barFilled), full) +
+		strings.Repeat(string(barEmpty), barCells-full)
+}
+
 // timeOfDay renders the time of day alone, without the weekday that clock() prepends.
 func timeOfDay(t time.Time) string { return t.Local().Format("15:04") }
 
@@ -755,13 +780,15 @@ func render() {
 		}
 		lines = append(lines,
 			fmt.Sprintf("%s %s", dot, name),
-			fmt.Sprintf(T().fiveHourLine, pct(r.fiveHourPct), remainingUntil(r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
-			fmt.Sprintf(T().sevenDayLine, pct(r.sevenDayPct), remainingUntil(r.sevenDayResetsAt), clock(r.sevenDayResetsAt)))
+			fmt.Sprintf(T().fiveHourLine, bar(r.fiveHourPct), pct(r.fiveHourPct),
+				remainingUntil(r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
+			fmt.Sprintf(T().sevenDayLine, bar(r.sevenDayPct), pct(r.sevenDayPct),
+				remainingUntil(r.sevenDayResetsAt), clock(r.sevenDayResetsAt)))
 		if r.opusPct != nil {
-			lines = append(lines, fmt.Sprintf(T().opusLine, pct(*r.opusPct)))
+			lines = append(lines, fmt.Sprintf(T().opusLine, bar(*r.opusPct), pct(*r.opusPct)))
 		}
 		if r.sonnetPct != nil {
-			lines = append(lines, fmt.Sprintf(T().sonnetLine, pct(*r.sonnetPct)))
+			lines = append(lines, fmt.Sprintf(T().sonnetLine, bar(*r.sonnetPct), pct(*r.sonnetPct)))
 		}
 		// The menu bar figure describes what you can still use right now, so a snapshot
 		// of an unreachable account must not drive it.
@@ -1005,6 +1032,19 @@ func runSelfCheck() {
 	assert(tokenFromJSON([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}`)) == "sk-ant-oat01-x",
 		"the token is read from JSON")
 	assert(tokenFromJSON([]byte(`{"mcpOAuth":{}}`)) == "", "no token when the section is missing")
+
+	// The gauge must always occupy the same width, or the rows stop lining up.
+	for _, v := range []float64{-5, 0, 0.4, 12.5, 50, 99.9, 100, 150} {
+		assert(len([]rune(bar(v))) == barCells, fmt.Sprintf("gauge width at %.1f%%", v))
+	}
+	assert(bar(0) == strings.Repeat("□", barCells), "an empty window draws an empty gauge")
+	assert(bar(100) == strings.Repeat("■", barCells), "a full window draws a full gauge")
+	assert(bar(150) == bar(100), "over 100% cannot overflow the gauge")
+	assert(bar(-5) == bar(0), "a negative value cannot underflow the gauge")
+	assert(bar(50) == strings.Repeat("■", barCells/2)+strings.Repeat("□", barCells/2),
+		"half a window draws half a gauge")
+	// Barely-used must still differ from unused, or a low reading reads as zero.
+	assert(bar(1) != bar(0), "any usage lights the first cell")
 
 	// Snapshots of unreachable accounts: appended after the live rows, in a stable order,
 	// and dropped as soon as a live row carries the same name.

@@ -16,7 +16,7 @@ struct UIStrings {
     let lastSeen: String   // "   · last seen %@", appended to an unreachable account's name
     let days: [String]
 
-    let fiveHourLine: String   // "   5h: %@ — resets in %@ (%@)"
+    let fiveHourLine: String   // "   5h  <gauge>  %@  resets in %@ (%@)"
     let sevenDayLine: String
     let opusLine: String
     let sonnetLine: String
@@ -58,10 +58,10 @@ let languages: [String: UIStrings] = [
         lastSeen: "   · last seen %@",
         days: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
 
-        fiveHourLine: "   5h: %@ — resets in %@ (%@)",
-        sevenDayLine: "   7d: %@ — resets in %@ (%@)",
-        opusLine: "   7d Opus: %@",
-        sonnetLine: "   7d Sonnet: %@",
+        fiveHourLine: "   5h  %@  %@  resets in %@ (%@)",
+        sevenDayLine: "   7d  %@  %@  resets in %@ (%@)",
+        opusLine: "   7d Opus    %@  %@",
+        sonnetLine: "   7d Sonnet  %@  %@",
 
         fiveHourWindow: "5-hour window",
         sevenDayWindow: "7-day window",
@@ -99,10 +99,10 @@ let languages: [String: UIStrings] = [
         lastSeen: "   · ostatnio widziane %@",
         days: ["niedz.", "pon.", "wt.", "śr.", "czw.", "pt.", "sob."],
 
-        fiveHourLine: "   5h: %@ — reset za %@ (%@)",
-        sevenDayLine: "   7d: %@ — reset za %@ (%@)",
-        opusLine: "   7d Opus: %@",
-        sonnetLine: "   7d Sonnet: %@",
+        fiveHourLine: "   5h  %@  %@  reset za %@ (%@)",
+        sevenDayLine: "   7d  %@  %@  reset za %@ (%@)",
+        opusLine: "   7d Opus    %@  %@",
+        sonnetLine: "   7d Sonnet  %@  %@",
 
         fiveHourWindow: "okno 5-godzinne",
         sevenDayWindow: "okno 7-dniowe",
