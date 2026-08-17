@@ -16,10 +16,15 @@ struct Account: Codable {
 }
 
 struct Config: Codable {
-    var accounts: [Account]
+    // Every field is optional so a partial file still decodes. A config holding nothing but
+    // a language setting is normal on a fresh install, and a strict decoder would throw the
+    // whole file away over the missing key.
+    var accounts: [Account]?
     var check_interval_minutes: Int?
     var slack_webhook_url: String?   // unused here, kept for claude-reset compatibility
     var language: String?
+
+    var accountList: [Account] { accounts ?? [] }
 }
 
 struct UsageWindow: Codable {
@@ -51,6 +56,10 @@ struct Reading {
     var sonnetPct: Double?
     var active: Bool
     var error: String?
+    /// nil for a live account. Set when the account can no longer be polled — Claude Code
+    /// was signed into a different one — and the row becomes a read-only snapshot of the
+    /// final reading.
+    var lastSeen: Date?
 }
 
 // MARK: - Reset detection (pure logic, no I/O)
@@ -219,7 +228,7 @@ let configURL = configDir.appendingPathComponent("config.json")
 func loadConfig() -> Config {
     guard let data = try? Data(contentsOf: configURL),
           let cfg = try? JSONDecoder().decode(Config.self, from: data)
-    else { return Config(accounts: [], check_interval_minutes: nil, slack_webhook_url: nil, language: nil) }
+    else { return Config() }
     return cfg
 }
 
@@ -298,6 +307,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Source names in display order — the Claude Code account first, then config accounts.
     private var sourceNames: [String] = []
     private var keychainLabel = "Claude Code"
+    /// Accounts that dropped out of reach, keyed by name, keeping their last reading so the
+    /// row does not simply vanish. Memory only — a restart forgets them.
+    private var staleAccounts: [String: Reading] = [:]
     private var polled = false
     private var pollTimer: Timer?
     private var tickTimer: Timer?
@@ -339,6 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func fastPollIfResetDue() {
         let now = Date()
         for (name, reading) in readings where reading.fiveHourResetsAt <= now {
+            guard reading.lastSeen == nil else { continue }
             guard fastPolled[name] != reading.fiveHourResetsAt else { continue }
             fastPolled[name] = reading.fiveHourResetsAt
             poll()
@@ -360,11 +373,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Extra accounts from the config (sessionKey). Isolated: an expired key on one must
         // not block the others.
-        for account in config.accounts {
+        for account in config.accountList {
             names.append(account.name)
             fetchUsage(account) { [weak self] result in
                 DispatchQueue.main.async { self?.apply(result, for: account.name) }
             }
+        }
+
+        // A stale account that came back within reach — signed into again, or added by
+        // sessionKey — is live now, so its snapshot goes away.
+        for name in names { staleAccounts.removeValue(forKey: name) }
+        for (name, snapshot) in staleAccounts.sorted(by: { $0.key < $1.key }) {
+            names.append(name)
+            readings[name] = snapshot
         }
 
         sourceNames = names
@@ -395,7 +416,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func switchKeychainAccount(to email: String) {
         guard email != keychainLabel else { return }
         let old = keychainLabel
-        readings.removeValue(forKey: old)
+        // Keep the final reading around. resets_at does not move until the window actually
+        // resets, so the countdown stays truthful even though nothing refreshes it.
+        if var last = readings.removeValue(forKey: old), last.error == nil {
+            last.lastSeen = Date()
+            staleAccounts[old] = last
+        }
         baselines.removeValue(forKey: old)
         fastPolled.removeValue(forKey: old)
         keychainLabel = email
@@ -410,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var r = readings[name] ?? Reading(fiveHourPct: 0, sevenDayPct: 0,
                                               fiveHourResetsAt: .distantFuture,
                                               sevenDayResetsAt: .distantFuture,
-                                              opusPct: nil, sonnetPct: nil, active: false, error: nil)
+                                              opusPct: nil, sonnetPct: nil, active: false, error: nil, lastSeen: nil)
             r.error = err.localizedDescription
             readings[name] = r
 
@@ -429,7 +455,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 opusPct: usage.seven_day_opus?.utilization,
                 sonnetPct: usage.seven_day_sonnet?.utilization,
                 active: session?.is_active ?? false,
-                error: nil)
+                error: nil,
+                lastSeen: nil)
 
             check(name: name, window: "five_hour", label: T.fiveHourWindow,
                   resetsAt: fiveReset, utilization: usage.five_hour.utilization)
@@ -456,17 +483,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateTitle() {
         guard !sourceNames.isEmpty else {
-            statusItem.button?.title = "Claude ⚙︎"
+            statusItem.button?.title = "Claude —"
             return
         }
-        let live = readings.values.filter { $0.error == nil }
+        let live = readings.values.filter { $0.error == nil && $0.lastSeen == nil }
         guard let worst = live.max(by: { $0.fiveHourPct < $1.fiveHourPct }) else {
-            statusItem.button?.title = "Claude ⚠︎"
+            statusItem.button?.title = "Claude !"
             return
         }
         // Once a window is exhausted the only thing that matters is when it returns.
         statusItem.button?.title = worst.fiveHourPct >= 100
-            ? "Claude ⏳ \(remaining(until: worst.fiveHourResetsAt))"
+            ? "Claude \(pct(worst.fiveHourPct)) · \(remaining(until: worst.fiveHourResetsAt))"
             : "Claude \(pct(worst.fiveHourPct))"
     }
 
@@ -493,7 +520,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 continue
             }
             // One menu item per line — NSMenuItem does not wrap a title on "\n".
-            var lines = ["\(r.active ? "●" : "○") \(name)",
+            // Status is spelled out rather than carried by a glyph, so the menu stays plain
+            // text and reads the same in every font and screen reader.
+            var label = name
+            if let seen = r.lastSeen {
+                label += String(format: T.lastSeen, clockFormatter.string(from: seen))
+            } else if r.active {
+                label += T.activeSuffix
+            }
+            var lines = [label,
                          String(format: T.fiveHourLine, pct(r.fiveHourPct),
                                 remaining(until: r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
                          String(format: T.sevenDayLine, pct(r.sevenDayPct),
@@ -583,7 +618,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
         let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty, !key.isEmpty else { return showError(T.nameAndKeyRequired) }
-        guard !config.accounts.contains(where: { $0.name == name }) else {
+        guard !config.accountList.contains(where: { $0.name == name }) else {
             return showError(String(format: T.accountExists, name))
         }
 
@@ -595,7 +630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.showError(err.localizedDescription)
                 case .success(let orgId):
                     var cfg = loadConfig()
-                    cfg.accounts.append(Account(name: name, session_key: key, org_id: orgId))
+                    cfg.accounts = cfg.accountList + [Account(name: name, session_key: key, org_id: orgId)]
                     do {
                         try saveConfig(cfg)
                         self.config = cfg
@@ -674,9 +709,24 @@ func runSelfCheck() {
         assert(!l.refreshNow.isEmpty && !l.quit.isEmpty && !l.language.isEmpty, "menu strings: \(code)")
         assert(!l.resetTitle.isEmpty && !l.resetBody.isEmpty, "message templates: \(code)")
         assert(l.days.count == 7 && !l.days.contains(where: \.isEmpty), "weekday names: \(code)")
+        assert(!l.lastSeen.isEmpty && !l.loading.isEmpty, "status strings: \(code)")
     }
 
+    // A partial config must survive decoding — a fresh install writes nothing but the
+    // language, and losing the whole file over a missing "accounts" key silently reverted
+    // the interface to the system locale.
+    let onlyLanguage = #"{"language":"en"}"#.data(using: .utf8)!
+    let partial = try! JSONDecoder().decode(Config.self, from: onlyLanguage)
+    assert(partial.language == "en")
+    assert(partial.accountList.isEmpty)
+
+    let full = #"{"accounts":[{"name":"a","session_key":"k","org_id":"o"}],"slack_webhook_url":"https://x","check_interval_minutes":5}"#
+    let parsed = try! JSONDecoder().decode(Config.self, from: full.data(using: .utf8)!)
+    assert(parsed.accountList.count == 1 && parsed.check_interval_minutes == 5)
+    assert(parsed.language == nil)
+
     // Format strings must accept exactly the arguments the call sites pass.
+    assert(String(format: T.lastSeen, "12:03").contains("12:03"))
     assert(String(format: T.resetTitle, "acc").contains("acc"))
     assert(String(format: T.fiveHourLine, "30%", "2h 1m", "Mon 11:29").contains("30%"))
     assert(String(format: T.accountExists, "dup").contains("dup"))

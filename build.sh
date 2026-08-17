@@ -5,6 +5,14 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="$DIR/build/ClaudeResetBar.app"
 
+# The interface is deliberately plain text. Fail the build if a pictographic character
+# creeps back into the sources, where it would render inconsistently across fonts,
+# terminals and screen readers.
+if grep -n '[⚙⏳⚠●○️︎]' "$DIR"/src/*.swift "$DIR"/cross/*.go "$DIR"/README.md 2>/dev/null; then
+    echo "Pictographic characters found in the sources listed above." >&2
+    exit 1
+fi
+
 # Self-check of the reset-detection logic — the build fails if an assertion trips.
 swiftc -Onone "$DIR/src/"*.swift -o "$DIR/build/.selfcheck" -module-name ClaudeResetBar 2>/dev/null \
   || { mkdir -p "$DIR/build"; swiftc -Onone "$DIR/src/"*.swift -o "$DIR/build/.selfcheck" -module-name ClaudeResetBar; }

@@ -9,7 +9,7 @@ A menu bar / system tray icon that shows your Claude usage limits and **notifies
 - **macOS, Windows, Linux.** One binary per system, no runtime, no installer.
 
 ```
-● you@example.com
+you@example.com   · in use
    5h: 39% — resets in 15m (Mon 11:29)
    7d: 23% — resets in 5d 13h (Sun 00:59)
 ```
@@ -53,7 +53,21 @@ Use `"auto"` to go back to following the system locale.
 
 ## Several accounts
 
-The account signed into Claude Code shows up on its own. Switching accounts with `/login` replaces it — the previous one disappears, because its credentials are gone. To watch **both at once**, add the second one via `sessionKey`.
+The account signed into Claude Code shows up on its own. Switching accounts with `/login` replaces it: Claude Code keeps one token at a time, so the previous account can no longer be polled.
+
+Rather than dropping its row, the app keeps the last reading it got, marked with the time it was taken:
+
+```
+new@example.com   · in use
+   5h: 2% — resets in 4h 47m (Mon 16:29)
+
+old@example.com   · last seen 12:03
+   5h: 40% — resets in 2h 14m (Mon 14:03)
+```
+
+The countdown on a snapshot row stays truthful, because `resets_at` does not move until the window actually resets — so you can still see when the other account frees up. Nothing refreshes it though, and no reset notification will arrive for it. Sign back into that account, or add it via `sessionKey`, and the row goes live again.
+
+Snapshots live in memory only; restarting the app forgets them. To watch **both accounts live**, add the second one via `sessionKey`.
 
 The config lives in `~/.config/claude-reset/config.json`, in a format compatible with the [claude-reset](https://github.com/nazarli-shabnam/claude-reset) CLI:
 

@@ -21,6 +21,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +74,10 @@ type reading struct {
 	sonnetPct        *float64
 	active           bool
 	err              string
+	// lastSeen is zero for a live account. It is set when the account can no longer be
+	// polled — Claude Code was signed into a different one — and the row becomes a
+	// read-only snapshot of the final reading.
+	lastSeen time.Time
 }
 
 // ─── Reset detection (pure logic, no I/O) ─────────────────────────────────────
@@ -132,6 +138,9 @@ func clock(t time.Time) string {
 }
 
 func pct(v float64) string { return fmt.Sprintf("%d%%", int(math.Round(v))) }
+
+// timeOfDay renders the time of day alone, without the weekday that clock() prepends.
+func timeOfDay(t time.Time) string { return t.Local().Format("15:04") }
 
 // ─── Credentials ──────────────────────────────────────────────────────────────
 
@@ -499,8 +508,11 @@ var (
 	baselines  = map[string]map[string]windowState{}
 	fastPolled = map[string]time.Time{}
 	oauthLabel = ""
-	polled     = false // set once the first poll returns, so the menu can say "loading"
-	pollNow    = make(chan struct{}, 1)
+	// Accounts that dropped out of reach, keyed by name, keeping their last reading so the
+	// row does not simply vanish. Memory only — a restart forgets them.
+	staleAccounts = map[string]reading{}
+	polled        = false // set once the first poll returns, so the menu can say "loading"
+	pollNow       = make(chan struct{}, 1)
 )
 
 func requestPoll() {
@@ -575,10 +587,39 @@ func switchOAuthAccount(label string) {
 		return
 	}
 	if oauthLabel != "" {
+		// Keep the final reading around. resets_at does not move until the window actually
+		// resets, so the countdown stays truthful even though nothing refreshes it.
+		for _, r := range readings {
+			if r.name == oauthLabel && r.err == "" {
+				r.lastSeen = time.Now()
+				staleAccounts[oauthLabel] = r
+			}
+		}
 		delete(baselines, oauthLabel)
 		delete(fastPolled, oauthLabel)
 	}
 	oauthLabel = label
+}
+
+// mergeStale appends snapshots of unreachable accounts after the live rows, skipping any
+// name a live row already covers. Sorted by name so the menu keeps a stable order — ranging
+// over a map would reshuffle the rows on every poll.
+func mergeStale(live []reading, stale map[string]reading) []reading {
+	covered := map[string]bool{}
+	for _, r := range live {
+		covered[r.name] = true
+	}
+	names := make([]string, 0, len(stale))
+	for name := range stale {
+		if !covered[name] {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		live = append(live, stale[name])
+	}
+	return live
 }
 
 func poll() {
@@ -612,7 +653,12 @@ func poll() {
 	}
 
 	mu.Lock()
-	readings = out
+	// A stale account that came back within reach — signed into again, or added by
+	// sessionKey — is live now, so its snapshot is discarded for good.
+	for _, r := range out {
+		delete(staleAccounts, r.name)
+	}
+	readings = mergeStale(out, staleAccounts)
 	polled = true
 	for _, r := range out {
 		if r.err != "" {
@@ -634,7 +680,7 @@ func fastPollIfResetDue() {
 	defer mu.Unlock()
 	now := time.Now()
 	for _, r := range readings {
-		if r.err != "" || r.fiveHourResetsAt.After(now) {
+		if r.err != "" || !r.lastSeen.IsZero() || r.fiveHourResetsAt.After(now) {
 			continue
 		}
 		if done, ok := fastPolled[r.name]; ok && done.Equal(r.fiveHourResetsAt) {
@@ -699,12 +745,17 @@ func render() {
 			lines = append(lines, r.name+" — "+T().errorWord, "   "+r.err)
 			continue
 		}
-		dot := "○"
-		if r.active {
-			dot = "●"
+		// Status is spelled out rather than carried by a glyph, so the menu stays plain
+		// text and reads the same in every font and screen reader.
+		name := r.name
+		switch {
+		case !r.lastSeen.IsZero():
+			name += fmt.Sprintf(T().lastSeen, timeOfDay(r.lastSeen))
+		case r.active:
+			name += T().activeSuffix
 		}
 		lines = append(lines,
-			fmt.Sprintf("%s %s", dot, r.name),
+			name,
 			fmt.Sprintf(T().fiveHourLine, pct(r.fiveHourPct), remainingUntil(r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
 			fmt.Sprintf(T().sevenDayLine, pct(r.sevenDayPct), remainingUntil(r.sevenDayResetsAt), clock(r.sevenDayResetsAt)))
 		if r.opusPct != nil {
@@ -713,7 +764,9 @@ func render() {
 		if r.sonnetPct != nil {
 			lines = append(lines, fmt.Sprintf(T().sonnetLine, pct(*r.sonnetPct)))
 		}
-		if r.fiveHourPct > worst {
+		// The menu bar figure describes what you can still use right now, so a snapshot
+		// of an unreachable account must not drive it.
+		if r.lastSeen.IsZero() && r.fiveHourPct > worst {
 			worst, worstReset = r.fiveHourPct, r.fiveHourResetsAt
 		}
 	}
@@ -727,13 +780,12 @@ func render() {
 		}
 	}
 
-	title := "Claude ⚙︎"
+	title := "Claude —"
 	if worst >= 0 {
+		title = "Claude " + pct(worst)
 		if worst >= 100 {
 			// Once a window is exhausted the only thing that matters is when it returns.
-			title = "Claude ⏳ " + remainingUntil(worstReset)
-		} else {
-			title = "Claude " + pct(worst)
+			title += " · " + remainingUntil(worstReset)
 		}
 	}
 	// Only macOS shows text next to the icon; on Windows and Linux the tooltip carries it.
@@ -744,7 +796,7 @@ func render() {
 
 func onReady() {
 	setTrayIcon(0)
-	systray.SetTitle("Claude ⚙︎")
+	systray.SetTitle("Claude —")
 	systray.SetTooltip(T().tooltipIdle)
 
 	for i := 0; i < infoSlots; i++ {
@@ -893,8 +945,10 @@ func runSelfCheck() {
 	for code, l := range languages {
 		assert(l.refreshNow != "" && l.quit != "" && l.language != "" && l.now != "",
 			"language "+code+" defines its menu strings")
-		assert(l.resetTitle != "" && l.resetBody != "" && l.fiveHourLine != "",
+		assert(l.resetTitle != "" && l.resetBody != "" && l.fiveHourLine != "" && l.lastSeen != "",
 			"language "+code+" defines its message templates")
+		assert(strings.Contains(fmt.Sprintf(l.lastSeen, "12:03"), "12:03"),
+			"language "+code+" renders the last-seen stamp")
 		for _, d := range l.days {
 			assert(d != "", "language "+code+" defines all weekday names")
 		}
@@ -933,6 +987,13 @@ func runSelfCheck() {
 	// Extreme values must not break at the angle boundaries.
 	assert(len(drawIcon(0, iconColor)) > 0 && len(drawIcon(100, iconColor)) > 0, "extreme values")
 
+	// A partial config must survive decoding — a fresh install writes nothing but the
+	// language, and losing the whole file over a missing "accounts" key would silently
+	// revert the interface to the system locale.
+	var partial Config
+	assert(json.Unmarshal([]byte(`{"language":"en"}`), &partial) == nil, "a language-only config parses")
+	assert(partial.Language == "en" && len(partial.Accounts) == 0, "a language-only config keeps its setting")
+
 	// A claude-reset config, webhook and all, must still parse.
 	var parsed Config
 	err = json.Unmarshal([]byte(`{"accounts":[{"name":"a","session_key":"k","org_id":"o"}],`+
@@ -945,6 +1006,23 @@ func runSelfCheck() {
 	assert(tokenFromJSON([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}`)) == "sk-ant-oat01-x",
 		"the token is read from JSON")
 	assert(tokenFromJSON([]byte(`{"mcpOAuth":{}}`)) == "", "no token when the section is missing")
+
+	// Snapshots of unreachable accounts: appended after the live rows, in a stable order,
+	// and dropped as soon as a live row carries the same name.
+	seen := time.Now()
+	stale := map[string]reading{
+		"zoe@example.com": {name: "zoe@example.com", lastSeen: seen},
+		"amy@example.com": {name: "amy@example.com", lastSeen: seen},
+	}
+	merged := mergeStale([]reading{{name: "live@example.com"}}, stale)
+	assert(len(merged) == 3, "snapshots are appended to the live rows")
+	assert(merged[0].name == "live@example.com", "live rows come first")
+	assert(merged[1].name == "amy@example.com" && merged[2].name == "zoe@example.com",
+		"snapshots keep a stable, sorted order")
+	shadowed := mergeStale([]reading{{name: "amy@example.com"}}, stale)
+	assert(len(shadowed) == 2 && shadowed[1].name == "zoe@example.com",
+		"a snapshot is skipped once the account is live again")
+	assert(len(mergeStale(nil, map[string]reading{})) == 0, "no snapshots, no rows")
 
 	fmt.Println("self-check OK")
 }

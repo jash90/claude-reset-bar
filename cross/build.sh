@@ -6,6 +6,14 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 mkdir -p build
 
+# The interface is deliberately plain text. Fail the build if a pictographic character
+# creeps back into the sources, where it would render inconsistently across fonts,
+# terminals and screen readers.
+if grep -n '[⚙⏳⚠●○️︎]' "$DIR"/../src/*.swift "$DIR"/*.go "$DIR"/../README.md 2>/dev/null; then
+    echo "Pictographic characters found in the sources listed above." >&2
+    exit 1
+fi
+
 # Self-check of the reset logic and icon generation — the build fails if an assertion trips.
 go build -o build/.selfcheck . && ./build/.selfcheck --test && rm -f build/.selfcheck
 

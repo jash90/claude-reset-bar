@@ -10,16 +10,18 @@ import (
 // Interface strings live in a struct rather than a key-value map so a typo is a compile
 // error instead of a blank menu entry at runtime.
 type strings18n struct {
-	refreshNow  string
-	openConfig  string
-	quit        string
-	language    string
-	noAccounts1 string
-	noAccounts2 string
-	loading     string
-	errorWord   string
-	now         string
-	days        [7]string
+	refreshNow   string
+	openConfig   string
+	quit         string
+	language     string
+	noAccounts1  string
+	noAccounts2  string
+	loading      string
+	errorWord    string
+	now          string
+	activeSuffix string // appended to the name of an account in use right now
+	lastSeen     string // " · last seen %s", appended to an unreachable account's name
+	days         [7]string
 
 	fiveHourLine string // "5h: %s — resets in %s (%s)"
 	sevenDayLine string
@@ -41,16 +43,18 @@ type strings18n struct {
 
 var languages = map[string]strings18n{
 	"en": {
-		refreshNow:  "Refresh now",
-		openConfig:  "Open config file",
-		quit:        "Quit",
-		language:    "Language",
-		noAccounts1: "No accounts — sign in to Claude Code",
-		noAccounts2: "or add a sessionKey in the config file",
-		loading:     "loading…",
-		errorWord:   "error",
-		now:         "now",
-		days:        [7]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"},
+		refreshNow:   "Refresh now",
+		openConfig:   "Open config file",
+		quit:         "Quit",
+		language:     "Language",
+		noAccounts1:  "No accounts — sign in to Claude Code",
+		noAccounts2:  "or add a sessionKey in the config file",
+		loading:      "loading…",
+		errorWord:    "error",
+		now:          "now",
+		activeSuffix: "   · in use",
+		lastSeen:     "   · last seen %s",
+		days:         [7]string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"},
 
 		fiveHourLine: "   5h: %s — resets in %s (%s)",
 		sevenDayLine: "   7d: %s — resets in %s (%s)",
@@ -71,16 +75,18 @@ var languages = map[string]strings18n{
 		tooltipIdle:  "ClaudeResetBar",
 	},
 	"pl": {
-		refreshNow:  "Odśwież teraz",
-		openConfig:  "Otwórz plik konfiguracji",
-		quit:        "Zakończ",
-		language:    "Język",
-		noAccounts1: "Brak kont — zaloguj się w Claude Code",
-		noAccounts2: "albo wpisz sessionKey w pliku konfiguracji",
-		loading:     "ładowanie…",
-		errorWord:   "błąd",
-		now:         "teraz",
-		days:        [7]string{"niedz.", "pon.", "wt.", "śr.", "czw.", "pt.", "sob."},
+		refreshNow:   "Odśwież teraz",
+		openConfig:   "Otwórz plik konfiguracji",
+		quit:         "Zakończ",
+		language:     "Język",
+		noAccounts1:  "Brak kont — zaloguj się w Claude Code",
+		noAccounts2:  "albo wpisz sessionKey w pliku konfiguracji",
+		loading:      "ładowanie…",
+		errorWord:    "błąd",
+		now:          "teraz",
+		activeSuffix: "   · w użyciu",
+		lastSeen:     "   · ostatnio widziane %s",
+		days:         [7]string{"niedz.", "pon.", "wt.", "śr.", "czw.", "pt.", "sob."},
 
 		fiveHourLine: "   5h: %s — reset za %s (%s)",
 		sevenDayLine: "   7d: %s — reset za %s (%s)",
