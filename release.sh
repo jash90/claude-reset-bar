@@ -1,5 +1,5 @@
 #!/bin/bash
-# Składa paczki do wydania w dist/. Wersję podaje się argumentem, np. ./release.sh v1.0.0
+# Assembles release packages into dist/. Pass the version as an argument, e.g. ./release.sh v1.0.0
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -9,22 +9,22 @@ DIST="$DIR/dist"
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
-echo "── ikony ────────────────────────────────────────────"
+echo "── icons ────────────────────────────────────────────"
 (cd "$DIR/cross" && go build -o build/.icons . && ./build/.icons --icons "$DIR/assets" && rm -f build/.icons)
 
-echo "── binarki przenośne ────────────────────────────────"
+echo "── portable binaries ────────────────────────────────"
 (cd "$DIR/cross" && ./build.sh --all)
 
-echo "── paczka Windows ───────────────────────────────────"
+echo "── Windows package ──────────────────────────────────"
 WIN="$DIST/win/claude-reset-bar"
 mkdir -p "$WIN"
 cp "$DIR/cross/build/claude-reset-bar.exe" "$WIN/"
 cp "$DIR/assets/icon.ico" "$DIR/README.md" "$DIR/LICENSE" "$WIN/"
-# Zawartość w podkatalogu, żeby rozpakowanie nie rozsypało plików po katalogu docelowym.
+# Contents nested in a folder so extracting does not scatter files into the target dir.
 (cd "$DIST/win" && zip -qr "$DIST/claude-reset-bar-$VERSION-windows-amd64.zip" claude-reset-bar)
 rm -rf "$DIST/win"
 
-echo "── paczki Linux ─────────────────────────────────────"
+echo "── Linux packages ───────────────────────────────────"
 for arch in amd64 arm64; do
     LIN="$DIST/linux-$arch/claude-reset-bar"
     mkdir -p "$LIN"
@@ -35,7 +35,7 @@ for arch in amd64 arm64; do
 [Desktop Entry]
 Type=Application
 Name=ClaudeResetBar
-Comment=Limity Claude w zasobniku systemowym
+Comment=Claude usage limits in the system tray
 Exec=claude-reset-bar
 Icon=claude-reset-bar
 Terminal=false
@@ -45,17 +45,17 @@ DESKTOP
     rm -rf "$DIST/linux-$arch"
 done
 
-# macOS buduje się tylko na macOS — AppKit wymaga CGO i lokalnego SDK.
+# macOS only builds on macOS — AppKit needs CGO and the local SDK.
 if [ "$(uname)" = "Darwin" ]; then
-    echo "── paczka macOS ─────────────────────────────────────"
+    echo "── macOS package ────────────────────────────────────"
     "$DIR/build.sh" >/dev/null
-    # ditto zachowuje atrybuty bundla, których zwykły zip gubi. Pakujemy sam .app —
-    # bez --sequesterRsrc, bo dokłada katalog __MACOSX, i z parentem wskazanym wprost,
-    # żeby po rozpakowaniu na wierzchu leżała aplikacja, a nie katalog roboczy.
+    # ditto preserves bundle attributes that a plain zip drops. We pack the .app alone —
+    # without --sequesterRsrc, which adds a __MACOSX folder, and with the parent named
+    # explicitly so extraction yields the app itself, not the staging directory.
     ditto -c -k --keepParent "$DIR/build/ClaudeResetBar.app" \
         "$DIST/ClaudeResetBar-$VERSION-macos-arm64.zip"
 else
-    echo "── paczka macOS pominięta (buduje się tylko na macOS) ─"
+    echo "── macOS package skipped (only builds on macOS) ─────"
 fi
 
 echo

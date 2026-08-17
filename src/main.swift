@@ -1,7 +1,8 @@
-// ClaudeResetBar — pasek menu macOS pokazujący limity kont Claude i powiadamiający o resecie.
-// Port logiki z github.com/nazarli-shabnam/claude-reset (TypeScript/Slack) na natywny Swift.
-// Współdzieli plik konfiguracyjny ~/.config/claude-reset/config.json, więc oba narzędzia
-// mogą korzystać z tych samych kont.
+// ClaudeResetBar — a macOS menu bar app showing Claude usage limits that notifies you the
+// moment a limit resets.
+//
+// It shares ~/.config/claude-reset/config.json with the portable Go build (../cross) and
+// with the claude-reset CLI, so all three can drive the same set of accounts.
 
 import AppKit
 import Foundation
@@ -17,7 +18,8 @@ struct Account: Codable {
 struct Config: Codable {
     var accounts: [Account]
     var check_interval_minutes: Int?
-    var slack_webhook_url: String?   // nieużywane tutaj, zachowane dla kompatybilności z claude-reset
+    var slack_webhook_url: String?   // unused here, kept for claude-reset compatibility
+    var language: String?
 }
 
 struct UsageWindow: Codable {
@@ -39,7 +41,7 @@ struct UsageResponse: Codable {
     let limits: [UsageLimit]?
 }
 
-/// Ostatni odczyt dla jednego konta — to, co rysuje menu.
+/// The latest reading for one account — this is what the menu draws.
 struct Reading {
     var fiveHourPct: Double
     var sevenDayPct: Double
@@ -51,34 +53,34 @@ struct Reading {
     var error: String?
 }
 
-// MARK: - Wykrywanie resetu (czysta logika, bez I/O)
+// MARK: - Reset detection (pure logic, no I/O)
 
 struct WindowState {
     var resetsAt: Date
     var utilization: Double
 }
 
-// Prawdziwy reset przesuwa resets_at o 5 godzin albo 7 dni. Próg 1h ignoruje drobne
-// fluktuacje znacznika czasu z API, a wciąż łapie każdy realny reset.
+// A real reset pushes resets_at forward by 5 hours or 7 days. A 1-hour threshold ignores
+// minor timestamp jitter from the API while still catching every legitimate reset.
 let resetMinInterval: TimeInterval = 60 * 60
 
-// API potrafi zwrócić epokę (1970) jako resets_at. Zapisanie tego jako punktu odniesienia
-// sprawiłoby, że następny poprawny znacznik wygląda jak skok o ~56 lat → fałszywy alarm.
+// The API occasionally returns the epoch (1970) for resets_at. Storing that as the baseline
+// would make the next valid timestamp look like a ~56-year jump and fire a bogus alert.
 let minPlausibleDate = Date(timeIntervalSince1970: 1_577_836_800) // 2020-01-01
 
-/// Zwraca (czy reset właśnie nastąpił, jaki stan zapisać na następny raz).
-/// Pierwszy odczyt zawsze tylko ustawia punkt odniesienia — nigdy nie strzela powiadomieniem.
+/// Reports whether a reset just happened and returns the baseline to persist.
+/// The first reading only records a baseline — it never fires.
 func detectReset(prev: WindowState?, resetsAt: Date, utilization: Double) -> (fired: Bool, next: WindowState) {
     let fresh = WindowState(resetsAt: resetsAt, utilization: utilization)
     guard let prev else { return (false, fresh) }
 
     let fired = resetsAt.timeIntervalSince(prev.resetsAt) > resetMinInterval
-    // Niewiarygodny znacznik odrzucamy, żeby nie zatruł porównania w następnej turze.
+    // Discard an implausible timestamp so it cannot poison the next comparison.
     let next = resetsAt >= minPlausibleDate ? fresh : prev
     return (fired, next)
 }
 
-// MARK: - Klient claude.ai
+// MARK: - claude.ai client
 
 enum ClaudeError: LocalizedError {
     case auth(Int)
@@ -88,18 +90,17 @@ enum ClaudeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .auth(let code):
-            return "Autoryzacja odrzucona (HTTP \(code)). Uruchom Claude Code, żeby odświeżył token, "
-                 + "albo dodaj konto z nowym sessionKey."
+            return String(format: T.authRejected, code)
         case .http(let code, let body):
-            return "HTTP \(code): \(body.prefix(120))"
+            return String(format: T.httpError, code, String(body.prefix(120)))
         case .shape:
-            return "Nieoczekiwany kształt odpowiedzi — prywatne API mogło się zmienić."
+            return T.shapeError
         }
     }
 }
 
-// Nagłówki naśladują żądanie przeglądarki z panelu claude.ai/settings/limits.
-// Brakujący albo zły User-Agent / Referer wywołuje challenge Cloudflare.
+// These headers mimic the request the claude.ai/settings/limits dashboard fires. A missing
+// or wrong User-Agent / Referer triggers a Cloudflare bot challenge.
 let browserHeaders: [String: String] = [
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -133,9 +134,10 @@ func fetchJSON(_ req: URLRequest, completion: @escaping (Result<Data, Error>) ->
     }.resume()
 }
 
-/// Każde konto claude.ai — również darmowe — należy do dokładnie jednej wewnętrznej
-/// "organizacji"; endpoint zużycia jest do niej przypięty. UUID nie jest widoczny w UI,
-/// więc pobieramy go sami, mając tylko sessionKey.
+/// Every claude.ai account — even a solo free one — belongs to exactly one internal
+/// "organization", which is why the usage endpoint is org-scoped. That UUID appears nowhere
+/// in the UI, so rather than asking the user to dig it out of DevTools we fetch it ourselves
+/// with nothing but the session key.
 func discoverOrgId(sessionKey: String, completion: @escaping (Result<String, Error>) -> Void) {
     fetchJSON(claudeRequest(path: "/api/organizations", sessionKey: sessionKey)) { result in
         completion(result.flatMap { data in
@@ -161,12 +163,12 @@ func fetchUsage(_ account: Account, completion: @escaping (Result<UsageResponse,
     fetchJSON(claudeRequest(path: path, sessionKey: account.session_key)) { completion(decodeUsage($0)) }
 }
 
-// MARK: - Konto z Claude Code (token OAuth z Keychaina)
+// MARK: - The Claude Code account (OAuth token from the Keychain)
 
-// Claude Code trzyma token subskrypcji w Keychainie pod "Claude Code-credentials" i sam go
-// odświeża. Czytamy go przy każdym odpytaniu, więc odświeżenie po stronie Claude Code jest
-// widoczne od razu. Świadomie NIE używamy refresh tokena — własne odświeżanie unieważniłoby
-// sesję Claude Code.
+// Claude Code stores its subscription token in the Keychain under "Claude Code-credentials"
+// and refreshes it itself. We re-read it on every poll, so a refresh performed by Claude Code
+// is picked up immediately. We deliberately do NOT use the refresh token — refreshing it
+// ourselves would invalidate Claude Code's own session.
 func keychainOAuthToken() -> String? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
@@ -197,7 +199,7 @@ func fetchUsageOAuth(token: String, completion: @escaping (Result<UsageResponse,
     fetchJSON(anthropicRequest(path: "/api/oauth/usage", token: token)) { completion(decodeUsage($0)) }
 }
 
-/// Etykieta konta zalogowanego w Claude Code — e-mail, żeby przy kilku kontach było widać które.
+/// Names the Claude Code account by its email, so several accounts stay distinguishable.
 func fetchOAuthLabel(token: String, completion: @escaping (String?) -> Void) {
     fetchJSON(anthropicRequest(path: "/api/oauth/profile", token: token)) { result in
         guard case .success(let data) = result,
@@ -208,7 +210,7 @@ func fetchOAuthLabel(token: String, completion: @escaping (String?) -> Void) {
     }
 }
 
-// MARK: - Konfiguracja (wspólna z claude-reset)
+// MARK: - Config (shared with claude-reset and the portable build)
 
 let configDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".config/claude-reset")
@@ -217,7 +219,7 @@ let configURL = configDir.appendingPathComponent("config.json")
 func loadConfig() -> Config {
     guard let data = try? Data(contentsOf: configURL),
           let cfg = try? JSONDecoder().decode(Config.self, from: data)
-    else { return Config(accounts: [], check_interval_minutes: nil, slack_webhook_url: nil) }
+    else { return Config(accounts: [], check_interval_minutes: nil, slack_webhook_url: nil, language: nil) }
     return cfg
 }
 
@@ -226,11 +228,11 @@ func saveConfig(_ cfg: Config) throws {
     let enc = JSONEncoder()
     enc.outputFormatting = [.prettyPrinted, .sortedKeys]
     try enc.encode(cfg).write(to: configURL)
-    // 0o600 — plik trzyma klucze sesji, nikt poza właścicielem go nie czyta.
+    // 0o600 — the file holds session keys, nobody but the owner reads it.
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
 }
 
-// MARK: - Formatowanie
+// MARK: - Formatting
 
 let isoWithFraction: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
@@ -245,14 +247,20 @@ func parseISO(_ s: String) -> Date? {
 
 let clockFormatter: DateFormatter = {
     let f = DateFormatter()
-    f.locale = Locale(identifier: "pl_PL")
-    f.dateFormat = "EEE HH:mm"
+    f.dateFormat = "HH:mm"
     return f
 }()
 
-/// "2h 14m" / "3d 4h" / "teraz" — ile zostało z podanej liczby sekund.
+/// Weekday plus time, with the weekday coming from the active language rather than the
+/// system locale — the whole interface follows one setting.
+func clock(_ date: Date) -> String {
+    let weekday = Calendar.current.component(.weekday, from: date) - 1
+    return "\(T.days[weekday]) \(clockFormatter.string(from: date))"
+}
+
+/// "2h 14m" / "3d 4h" / "now" — how much of the given number of seconds is left.
 func remaining(seconds: Int) -> String {
-    if seconds <= 0 { return "teraz" }
+    if seconds <= 0 { return T.now }
     let d = seconds / 86400, h = (seconds % 86400) / 3600, m = (seconds % 3600) / 60
     if d > 0 { return "\(d)d \(h)h" }
     if h > 0 { return "\(h)h \(m)m" }
@@ -265,9 +273,9 @@ func remaining(until date: Date) -> String {
 
 func pct(_ v: Double) -> String { "\(Int(v.rounded()))%" }
 
-/// Powiadomienie systemowe. ponytail: osascript zamiast UNUserNotificationCenter —
-/// nie wymaga podpisanego bundla ani dialogu o zgodę. Jeśli banner ma mieć własną ikonę
-/// zamiast Script Editora, to jest moment na przejście na UNUserNotificationCenter.
+/// A system notification. ponytail: osascript rather than UNUserNotificationCenter — it needs
+/// neither a signed bundle nor an authorization dialog. If the banner should carry its own
+/// icon instead of Script Editor's, that is the moment to switch.
 func notify(title: String, message: String) {
     func esc(_ s: String) -> String { s.replacingOccurrences(of: "\"", with: "'") }
     let script = "display notification \"\(esc(message))\" with title \"\(esc(title))\" sound name \"Glass\""
@@ -277,23 +285,25 @@ func notify(title: String, message: String) {
     try? p.run()
 }
 
-// MARK: - Aplikacja
+// MARK: - Application
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var config = loadConfig()
     private var readings: [String: Reading] = [:]
-    /// Punkt odniesienia per konto i okno — pierwszy odczyt tylko ustawia, nigdy nie powiadamia.
+    /// Per account and window — the first reading only records, it never notifies.
     private var baselines: [String: [String: WindowState]] = [:]
-    /// Znaczniki resets_at, po których już wystrzeliło doraźne odpytanie — patrz fastPollIfResetDue().
+    /// resets_at values that already triggered an off-schedule poll — see fastPollIfResetDue().
     private var fastPolled: [String: Date] = [:]
-    /// Nazwy źródeł w kolejności wyświetlania — konto z Claude Code, potem konta z configu.
+    /// Source names in display order — the Claude Code account first, then config accounts.
     private var sourceNames: [String] = []
     private var keychainLabel = "Claude Code"
+    private var polled = false
     private var pollTimer: Timer?
     private var tickTimer: Timer?
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        currentLang = resolveLanguage(configured: config.language)
         statusItem.button?.title = "Claude —"
         statusItem.menu = NSMenu()
         statusItem.menu?.delegate = self
@@ -308,12 +318,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startTimers() {
         pollTimer?.invalidate()
-        // Odpytywanie API — rzadkie, bo limity zmieniają się wolno.
+        // Polling the API is infrequent because limits move slowly.
         pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             self?.poll()
         }
-        // Osobny, częsty tick tylko przelicza odliczanie z zapamiętanych resets_at,
-        // żeby tytuł w pasku nie stał w miejscu między odpytaniami API.
+        // A separate, frequent tick only recomputes countdowns from the cached resets_at, so
+        // the menu bar title never goes stale between API calls.
         tickTimer?.invalidate()
         tickTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -322,10 +332,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Minął zapamiętany czas resetu — odpytaj od razu, zamiast czekać do końca interwału.
-    /// Skraca opóźnienie powiadomienia z ~15 minut do ~1 minuty. Każdy znacznik resets_at
-    /// wyzwala to dokładnie raz — inaczej konto, dla którego API zwraca nieruchomą przeszłą
-    /// datę, byłoby odpytywane co minutę bez końca.
+    /// A remembered reset time has passed, so poll straight away instead of waiting out the
+    /// interval. That cuts notification lag from ~15 minutes to ~1 minute. Each resets_at
+    /// value triggers this exactly once — otherwise an account whose API keeps returning a
+    /// stale past date would be polled every minute forever.
     private func fastPollIfResetDue() {
         let now = Date()
         for (name, reading) in readings where reading.fiveHourResetsAt <= now {
@@ -336,20 +346,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: Odpytywanie
+    // MARK: Polling
 
     @objc func poll() {
         config = loadConfig()
         var names: [String] = []
 
-        // Konto zalogowane w Claude Code — bez żadnej konfiguracji.
+        // The account signed into Claude Code — no configuration needed.
         if let token = keychainOAuthToken() {
             names.append(keychainLabel)
             pollKeychainAccount(token: token)
         }
 
-        // Dodatkowe konta z configu (sessionKey). Izolowane: wygasły klucz na jednym
-        // nie blokuje pozostałych.
+        // Extra accounts from the config (sessionKey). Isolated: an expired key on one must
+        // not block the others.
         for account in config.accounts {
             names.append(account.name)
             fetchUsage(account) { [weak self] result in
@@ -362,10 +372,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    /// Etykietę pobieramy przy każdym odpytaniu — /login w Claude Code podmienia konto pod
-    /// tym samym wpisem w Keychainie. Zapytanie o zużycie idzie dopiero po ustaleniu nazwy,
-    /// bo nazwa jest kluczem stanu: odwrotna kolejność przypisałaby odczyt nowego konta do
-    /// punktu odniesienia poprzedniego.
+    /// The label is fetched on every poll — /login in Claude Code swaps the account behind
+    /// the same Keychain entry. The usage request only goes out once the name is settled,
+    /// because the name keys our state: the other order would file a new account's reading
+    /// under the previous account's baseline.
     private func pollKeychainAccount(token: String) {
         fetchOAuthLabel(token: token) { [weak self] email in
             DispatchQueue.main.async {
@@ -379,9 +389,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Zmiana konta w Claude Code. Stary punkt odniesienia dotyczy okna limitów innego
-    /// konta, więc go porzucamy — nowe konto zaczyna od własnego pierwszego odczytu
-    /// i nie dostaje fałszywego powiadomienia o resecie.
+    /// The Claude Code account changed. The old baseline describes a different account's
+    /// limit window, so it is dropped — the new account starts from its own first reading
+    /// and never gets a bogus reset notification.
     private func switchKeychainAccount(to email: String) {
         guard email != keychainLabel else { return }
         let old = keychainLabel
@@ -394,6 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func apply(_ result: Result<UsageResponse, Error>, for name: String) {
+        polled = true
         switch result {
         case .failure(let err):
             var r = readings[name] ?? Reading(fiveHourPct: 0, sevenDayPct: 0,
@@ -420,9 +431,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 active: session?.is_active ?? false,
                 error: nil)
 
-            check(name: name, window: "five_hour", label: "okno 5-godzinne",
+            check(name: name, window: "five_hour", label: T.fiveHourWindow,
                   resetsAt: fiveReset, utilization: usage.five_hour.utilization)
-            check(name: name, window: "seven_day", label: "okno 7-dniowe",
+            check(name: name, window: "seven_day", label: T.sevenDayWindow,
                   resetsAt: sevenReset, utilization: usage.seven_day.utilization)
         }
         updateTitle()
@@ -434,14 +445,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let (fired, next) = detectReset(prev: prev, resetsAt: resetsAt, utilization: utilization)
 
         if fired, let prev {
-            notify(title: "\(name): limit zresetowany",
-                   message: "\(label) odświeżone (\(pct(prev.utilization)) → \(pct(utilization))). "
-                          + "Następny reset: \(clockFormatter.string(from: resetsAt)).")
+            notify(title: String(format: T.resetTitle, name),
+                   message: String(format: T.resetBody, label,
+                                   pct(prev.utilization), pct(utilization), clock(resetsAt)))
         }
         baselines[name, default: [:]][window] = next
     }
 
-    // MARK: Pasek menu
+    // MARK: Menu bar
 
     private func updateTitle() {
         guard !sourceNames.isEmpty else {
@@ -453,7 +464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.title = "Claude ⚠︎"
             return
         }
-        // Przy wyczerpanym oknie liczy się już tylko to, kiedy wróci.
+        // Once a window is exhausted the only thing that matters is when it returns.
         statusItem.button?.title = worst.fiveHourPct >= 100
             ? "Claude ⏳ \(remaining(until: worst.fiveHourResetsAt))"
             : "Claude \(pct(worst.fiveHourPct))"
@@ -463,34 +474,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
 
-        if sourceNames.isEmpty {
-            menu.addItem(disabled("Brak kont — zaloguj się w Claude Code albo dodaj konto"))
+        if !polled && sourceNames.isEmpty {
+            // Before the first poll returns there is nothing to say — and claiming there are
+            // no accounts would be wrong for the second it takes.
+            menu.addItem(disabled(T.loading))
+        } else if sourceNames.isEmpty {
+            menu.addItem(disabled(T.noAccounts))
         }
+
         for name in sourceNames {
             guard let r = readings[name] else {
-                menu.addItem(disabled("\(name) — ładowanie…"))
+                menu.addItem(disabled("\(name) — \(T.loading)"))
                 continue
             }
             if let err = r.error {
-                menu.addItem(disabled("\(name) — błąd"))
+                menu.addItem(disabled("\(name) — \(T.errorWord)"))
                 menu.addItem(disabled("   \(err)"))
                 continue
             }
-            // Osobna pozycja menu na linię — NSMenuItem nie łamie tytułu po "\n".
+            // One menu item per line — NSMenuItem does not wrap a title on "\n".
             var lines = ["\(r.active ? "●" : "○") \(name)",
-                         "   5h: \(pct(r.fiveHourPct)) — reset za \(remaining(until: r.fiveHourResetsAt)) (\(clockFormatter.string(from: r.fiveHourResetsAt)))",
-                         "   7d: \(pct(r.sevenDayPct)) — reset za \(remaining(until: r.sevenDayResetsAt)) (\(clockFormatter.string(from: r.sevenDayResetsAt)))"]
-            if let o = r.opusPct { lines.append("   7d Opus: \(pct(o))") }
-            if let s = r.sonnetPct { lines.append("   7d Sonnet: \(pct(s))") }
+                         String(format: T.fiveHourLine, pct(r.fiveHourPct),
+                                remaining(until: r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
+                         String(format: T.sevenDayLine, pct(r.sevenDayPct),
+                                remaining(until: r.sevenDayResetsAt), clock(r.sevenDayResetsAt))]
+            if let o = r.opusPct { lines.append(String(format: T.opusLine, pct(o))) }
+            if let s = r.sonnetPct { lines.append(String(format: T.sonnetLine, pct(s))) }
             for line in lines { menu.addItem(disabled(line)) }
         }
 
         menu.addItem(.separator())
-        menu.addItem(action("Odśwież teraz", #selector(poll)))
-        menu.addItem(action("Dodaj konto…", #selector(addAccount)))
-        menu.addItem(action("Otwórz plik konfiguracji", #selector(openConfig)))
+        menu.addItem(action(T.refreshNow, #selector(poll)))
+        menu.addItem(action(T.addAccount, #selector(addAccount)))
+        menu.addItem(action(T.openConfig, #selector(openConfig)))
+        menu.addItem(languageMenuItem())
         menu.addItem(.separator())
-        menu.addItem(action("Zakończ", #selector(NSApplication.terminate(_:)), target: NSApp))
+        menu.addItem(action(T.quit, #selector(NSApplication.terminate(_:)), target: NSApp))
+    }
+
+    private func languageMenuItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: T.language, action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        for (index, entry) in languageOrder.enumerated() {
+            let item = NSMenuItem(title: entry.name, action: #selector(pickLanguage(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            item.state = entry.code == currentLang ? .on : .off
+            submenu.addItem(item)
+        }
+        parent.submenu = submenu
+        return parent
     }
 
     private func disabled(_ title: String) -> NSMenuItem {
@@ -505,7 +538,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
-    // MARK: Akcje
+    // MARK: Actions
+
+    @objc private func pickLanguage(_ sender: NSMenuItem) {
+        guard languageOrder.indices.contains(sender.tag) else { return }
+        currentLang = languageOrder[sender.tag].code
+        do {
+            try saveLanguage(currentLang)
+        } catch {
+            showError(String(format: T.saveFailed, error.localizedDescription))
+        }
+        config = loadConfig()
+        updateTitle()
+        rebuildMenu()
+    }
 
     @objc private func openConfig() {
         if !FileManager.default.fileExists(atPath: configURL.path) {
@@ -518,15 +564,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         let alert = NSAlert()
-        alert.messageText = "Dodaj konto Claude"
-        alert.informativeText = "sessionKey znajdziesz w DevTools → Application → Cookies → claude.ai → sessionKey"
-        alert.addButton(withTitle: "Dodaj")
-        alert.addButton(withTitle: "Anuluj")
+        alert.messageText = T.addAccountTitle
+        alert.informativeText = T.addAccountHint
+        alert.addButton(withTitle: T.addButton)
+        alert.addButton(withTitle: T.cancelButton)
 
         let nameField = NSTextField(frame: NSRect(x: 0, y: 30, width: 320, height: 24))
-        nameField.placeholderString = "Nazwa konta (np. prywatne)"
+        nameField.placeholderString = T.namePlaceholder
         let keyField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        keyField.placeholderString = "sk-ant-sid01-…"
+        keyField.placeholderString = T.keyPlaceholder
         let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 54))
         box.addSubview(nameField)
         box.addSubview(keyField)
@@ -536,9 +582,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
         let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, !key.isEmpty else { return showError("Nazwa i sessionKey są wymagane.") }
+        guard !name.isEmpty, !key.isEmpty else { return showError(T.nameAndKeyRequired) }
         guard !config.accounts.contains(where: { $0.name == name }) else {
-            return showError("Konto o nazwie \"\(name)\" już istnieje.")
+            return showError(String(format: T.accountExists, name))
         }
 
         discoverOrgId(sessionKey: key) { [weak self] result in
@@ -556,7 +602,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.startTimers()
                         self.poll()
                     } catch {
-                        self.showError("Nie udało się zapisać konfiguracji: \(error.localizedDescription)")
+                        self.showError(String(format: T.saveFailed, error.localizedDescription))
                     }
                 }
             }
@@ -567,50 +613,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
         a.alertStyle = .warning
-        a.messageText = "Nie udało się"
+        a.messageText = T.failedTitle
         a.informativeText = text
         a.runModal()
     }
 }
 
 extension AppDelegate: NSMenuDelegate {
-    // Odliczanie w menu ma być świeże w chwili otwarcia, nie sprzed minuty.
+    // Countdowns must be fresh at the moment the menu opens, not a minute old.
     func menuWillOpen(_ menu: NSMenu) { rebuildMenu() }
 }
 
 // MARK: - Self-check
 
-/// `ClaudeResetBar --test` — sprawdza logikę wykrywania resetu (jedyny nietrywialny kawałek).
+/// `ClaudeResetBar --test` — exercises reset detection and formatting, the only non-trivial
+/// logic in the app.
 func runSelfCheck() {
     let now = Date()
     let plus5h = now.addingTimeInterval(5 * 3600)
 
-    // Pierwszy odczyt tylko ustawia punkt odniesienia.
+    // The first reading only records a baseline.
     let first = detectReset(prev: nil, resetsAt: now, utilization: 80)
     assert(first.fired == false)
     assert(first.next.resetsAt == now)
 
-    // Ten sam znacznik = brak resetu.
+    // The same timestamp is not a reset.
     let same = detectReset(prev: first.next, resetsAt: now, utilization: 95)
     assert(same.fired == false)
 
-    // Skok o 5h = reset.
+    // A 5-hour jump is a reset.
     let jump = detectReset(prev: first.next, resetsAt: plus5h, utilization: 0)
     assert(jump.fired == true)
     assert(jump.next.resetsAt == plus5h)
 
-    // Drobne przesunięcie poniżej progu 1h = nie reset.
+    // Drift below the 1-hour threshold is not a reset.
     let drift = detectReset(prev: first.next, resetsAt: now.addingTimeInterval(600), utilization: 81)
     assert(drift.fired == false)
 
-    // Epoka z API nie może zatruć punktu odniesienia.
+    // An epoch timestamp must not poison the baseline.
     let epoch = detectReset(prev: first.next, resetsAt: Date(timeIntervalSince1970: 0), utilization: 0)
     assert(epoch.next.resetsAt == first.next.resetsAt)
 
-    assert(remaining(seconds: -5) == "teraz")
+    // Duration formatting, in whichever language is active.
+    currentLang = "en"
+    assert(remaining(seconds: -5) == "now")
     assert(remaining(seconds: 3 * 3600 + 120) == "3h 2m")
     assert(remaining(seconds: 45 * 60) == "45m")
     assert(remaining(seconds: 3 * 86400 + 4 * 3600) == "3d 4h")
+    currentLang = "pl"
+    assert(remaining(seconds: -5) == "teraz")
+    currentLang = "en"
+
+    // Language resolution: the config wins, an unknown code falls back to English.
+    assert(resolveLanguage(configured: "pl") == "pl")
+    assert(resolveLanguage(configured: "de") == "en")
+    assert(languages[resolveLanguage(configured: nil)] != nil)
+
+    // Every language must define every string, or the menu shows blanks.
+    for (code, l) in languages {
+        assert(!l.refreshNow.isEmpty && !l.quit.isEmpty && !l.language.isEmpty, "menu strings: \(code)")
+        assert(!l.resetTitle.isEmpty && !l.resetBody.isEmpty, "message templates: \(code)")
+        assert(l.days.count == 7 && !l.days.contains(where: \.isEmpty), "weekday names: \(code)")
+    }
+
+    // Format strings must accept exactly the arguments the call sites pass.
+    assert(String(format: T.resetTitle, "acc").contains("acc"))
+    assert(String(format: T.fiveHourLine, "30%", "2h 1m", "Mon 11:29").contains("30%"))
+    assert(String(format: T.accountExists, "dup").contains("dup"))
 
     print("self-check OK")
 }
@@ -623,7 +692,7 @@ if CommandLine.arguments.contains("--test") {
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)   // brak ikony w Docku — appka żyje tylko w pasku menu
+app.setActivationPolicy(.accessory)   // no Dock icon — the app lives in the menu bar only
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()

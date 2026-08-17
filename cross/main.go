@@ -1,10 +1,10 @@
-// ClaudeResetBar (cross) — ikona w zasobniku systemowym pokazująca limity Claude
-// i powiadamiająca, gdy okno 5h albo 7d się zresetuje. macOS, Windows, Linux.
+// ClaudeResetBar (portable) — a tray icon showing Claude usage limits that notifies you
+// the moment a 5-hour or 7-day window resets. macOS, Windows, Linux.
 //
-// Odpowiednik natywnej wersji Swift (../src/main.swift), z tą samą logiką wykrywania
-// resetu. Różnice wymuszone przez systray: menu buduje się raz przy starcie i tylko
-// aktualizuje tytuły pozycji, a kont nie dodaje się przez okno dialogowe — tylko
-// edycją pliku konfiguracyjnego.
+// Counterpart to the native Swift build (../src/main.swift), sharing its reset-detection
+// logic and config file. Two differences are forced by systray: the menu is built once at
+// startup and only its titles change afterwards, and accounts are added by editing the
+// config file rather than through a dialog.
 package main
 
 import (
@@ -59,6 +59,7 @@ type Config struct {
 	Accounts             []Account `json:"accounts"`
 	CheckIntervalMinutes int       `json:"check_interval_minutes,omitempty"`
 	SlackWebhookURL      string    `json:"slack_webhook_url,omitempty"`
+	Language             string    `json:"language,omitempty"`
 }
 
 type reading struct {
@@ -73,42 +74,42 @@ type reading struct {
 	err              string
 }
 
-// ─── Wykrywanie resetu (czysta logika, bez I/O) ───────────────────────────────
+// ─── Reset detection (pure logic, no I/O) ─────────────────────────────────────
 
 type windowState struct {
 	resetsAt    time.Time
 	utilization float64
 }
 
-// Prawdziwy reset przesuwa resets_at o 5 godzin albo 7 dni. Próg 1h ignoruje drobne
-// fluktuacje znacznika czasu z API, a wciąż łapie każdy realny reset.
+// A real reset pushes resets_at forward by 5 hours or 7 days. A 1-hour threshold ignores
+// minor timestamp jitter from the API while still catching every legitimate reset.
 const resetMinInterval = time.Hour
 
-// API potrafi zwrócić epokę (1970) jako resets_at. Zapisanie tego jako punktu odniesienia
-// sprawiłoby, że następny poprawny znacznik wygląda jak skok o ~56 lat → fałszywy alarm.
+// The API occasionally returns the epoch (1970) for resets_at. Storing that as the baseline
+// would make the next valid timestamp look like a ~56-year jump and fire a bogus alert.
 var minPlausible = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 
-// detectReset zwraca (czy reset właśnie nastąpił, jaki stan zapisać na następny raz).
-// Pierwszy odczyt zawsze tylko ustawia punkt odniesienia — nigdy nie strzela powiadomieniem.
+// detectReset reports whether a reset just happened and returns the baseline to persist.
+// The first reading only records a baseline — it never fires.
 func detectReset(prev *windowState, resetsAt time.Time, utilization float64) (bool, windowState) {
 	fresh := windowState{resetsAt: resetsAt, utilization: utilization}
 	if prev == nil {
 		return false, fresh
 	}
 	fired := resetsAt.Sub(prev.resetsAt) > resetMinInterval
-	// Niewiarygodny znacznik odrzucamy, żeby nie zatruł porównania w następnej turze.
+	// Discard an implausible timestamp so it cannot poison the next comparison.
 	if resetsAt.Before(minPlausible) {
 		return fired, *prev
 	}
 	return fired, fresh
 }
 
-// ─── Formatowanie ─────────────────────────────────────────────────────────────
+// ─── Formatting ───────────────────────────────────────────────────────────────
 
-// "2h 14m" / "3d 4h" / "teraz" — ile zostało z podanej liczby sekund.
+// remaining renders a duration as "2h 14m" / "3d 4h" / "now".
 func remaining(seconds int) string {
 	if seconds <= 0 {
-		return "teraz"
+		return T().now
 	}
 	d, h, m := seconds/86400, (seconds%86400)/3600, (seconds%3600)/60
 	switch {
@@ -125,16 +126,14 @@ func remainingUntil(t time.Time) string {
 	return remaining(int(time.Until(t).Round(time.Second).Seconds()))
 }
 
-var plDays = [...]string{"niedz.", "pon.", "wt.", "śr.", "czw.", "pt.", "sob."}
-
 func clock(t time.Time) string {
 	t = t.Local()
-	return fmt.Sprintf("%s %s", plDays[int(t.Weekday())], t.Format("15:04"))
+	return fmt.Sprintf("%s %s", T().days[int(t.Weekday())], t.Format("15:04"))
 }
 
 func pct(v float64) string { return fmt.Sprintf("%d%%", int(math.Round(v))) }
 
-// ─── Poświadczenia ────────────────────────────────────────────────────────────
+// ─── Credentials ──────────────────────────────────────────────────────────────
 
 func homeFile(parts ...string) string {
 	home, err := os.UserHomeDir()
@@ -156,13 +155,13 @@ func tokenFromJSON(raw []byte) string {
 	return doc.ClaudeAiOauth.AccessToken
 }
 
-// oauthToken zwraca token subskrypcji zapisany przez Claude Code. Na Windows i Linux
-// leży on w ~/.claude/.credentials.json; na macOS Claude Code trzyma go w Keychainie,
-// więc plik jest tylko pierwszym miejscem, w które zaglądamy.
+// oauthToken returns the subscription token Claude Code stored. On Windows and Linux it
+// lives in ~/.claude/.credentials.json; on macOS Claude Code keeps it in the Keychain, so
+// the file is only the first place we look.
 //
-// Świadomie NIE używamy refresh tokena — własne odświeżanie unieważniłoby sesję
-// Claude Code. Token czytamy przy każdym odpytaniu, więc odświeżenie po stronie
-// Claude Code jest widoczne od razu.
+// We deliberately do NOT use the refresh token — refreshing it ourselves would invalidate
+// Claude Code's own session. The token is re-read on every poll, so a refresh performed by
+// Claude Code is picked up immediately.
 func oauthToken() string {
 	if raw, err := os.ReadFile(homeFile(".claude", ".credentials.json")); err == nil {
 		if tok := tokenFromJSON(raw); tok != "" {
@@ -179,26 +178,25 @@ func oauthToken() string {
 	return ""
 }
 
-// ─── Klienci HTTP ─────────────────────────────────────────────────────────────
+// ─── HTTP clients ─────────────────────────────────────────────────────────────
 
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
 func doJSON(req *http.Request, out any) error {
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("błąd sieci: %w", err)
+		return fmt.Errorf(T().networkError, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return fmt.Errorf("autoryzacja odrzucona (HTTP %d) — uruchom Claude Code, "+
-			"żeby odświeżył token, albo wpisz nowy sessionKey", resp.StatusCode)
+		return fmt.Errorf(T().authRejected, resp.StatusCode)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		return fmt.Errorf("nieoczekiwany kształt odpowiedzi: %w", err)
+		return fmt.Errorf(T().badShape, err)
 	}
 	return nil
 }
@@ -216,7 +214,7 @@ func fetchUsageOAuth(token string) (UsageResponse, error) {
 	return u, doJSON(anthropicReq("/api/oauth/usage", token), &u)
 }
 
-// fetchOAuthLabel podpisuje konto e-mailem, żeby przy kilku kontach było widać które.
+// fetchOAuthLabel names the account by its email so several accounts stay distinguishable.
 func fetchOAuthLabel(token string) string {
 	var doc struct {
 		Account struct {
@@ -233,8 +231,8 @@ func fetchOAuthLabel(token string) string {
 	return doc.Account.DisplayName
 }
 
-// Nagłówki naśladują żądanie przeglądarki z panelu claude.ai/settings/limits.
-// Brakujący albo zły User-Agent / Referer wywołuje challenge Cloudflare.
+// These headers mimic the request the claude.ai/settings/limits dashboard fires. A missing
+// or wrong User-Agent / Referer triggers a Cloudflare bot challenge.
 var browserHeaders = map[string]string{
 	"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 	"Accept":          "application/json, text/plain, */*",
@@ -258,7 +256,7 @@ func fetchUsageSession(a Account) (UsageResponse, error) {
 	return u, doJSON(req, &u)
 }
 
-// ─── Konfiguracja (wspólna z claude-reset i wersją Swift) ──────────────────────
+// ─── Config (shared with claude-reset and the Swift build) ────────────────────
 
 func configPath() string { return homeFile(".config", "claude-reset", "config.json") }
 
@@ -270,7 +268,7 @@ func loadConfig() Config {
 	return cfg
 }
 
-// ensureConfig tworzy pusty szkielet, żeby "Otwórz plik konfiguracji" miało co otworzyć.
+// ensureConfig writes an empty skeleton so "Open config file" has something to open.
 func ensureConfig() error {
 	if _, err := os.Stat(configPath()); err == nil {
 		return nil
@@ -281,7 +279,7 @@ func ensureConfig() error {
 	skeleton := []byte("{\n  \"accounts\": [\n" +
 		"    { \"name\": \"\", \"session_key\": \"\", \"org_id\": \"\" }\n" +
 		"  ],\n  \"check_interval_minutes\": 15\n}\n")
-	// 0o600 — plik trzyma klucze sesji, nikt poza właścicielem go nie czyta.
+	// 0o600 — the file holds session keys, nobody but the owner reads it.
 	return os.WriteFile(configPath(), skeleton, 0o600)
 }
 
@@ -296,13 +294,13 @@ func openInEditor(path string) {
 	}
 }
 
-// ─── Ikona ────────────────────────────────────────────────────────────────────
+// ─── Tray icon ────────────────────────────────────────────────────────────────
 
 const iconSize = 32
 
-// drawIcon rysuje tarczę wypełnioną proporcjonalnie do zużycia. Na Windows i Linux
-// to jedyny nośnik informacji w zasobniku — tam nie ma tekstu obok ikony, jak w pasku
-// menu macOS.
+// drawIcon renders a dial filled in proportion to usage. On Windows and Linux this is the
+// only carrier of information in the tray — unlike the macOS menu bar, there is no text
+// next to the icon.
 func drawIcon(percent float64, c color.RGBA) []byte {
 	img := image.NewRGBA(image.Rect(0, 0, iconSize, iconSize))
 	center := float64(iconSize) / 2
@@ -317,13 +315,13 @@ func drawIcon(percent float64, c color.RGBA) []byte {
 			if dist > radius {
 				continue
 			}
-			// Kąt liczony od godziny 12, zgodnie z ruchem wskazówek.
+			// Angle measured from 12 o'clock, going clockwise.
 			angle := math.Atan2(dx, -dy)
 			if angle < 0 {
 				angle += 2 * math.Pi
 			}
 			switch {
-			case dist > radius-2.5: // obwódka zawsze pełna, żeby ikona była czytelna przy 0%
+			case dist > radius-2.5: // the rim stays solid so the icon reads even at 0%
 				img.Set(x, y, c)
 			case angle <= frac*2*math.Pi:
 				img.Set(x, y, c)
@@ -338,13 +336,13 @@ func drawIcon(percent float64, c color.RGBA) []byte {
 	return buf.Bytes()
 }
 
-// toICO pakuje jeden lub więcej PNG-ów w kontener ICO — tego wymaga zasobnik Windows
-// i ikona pliku .exe. PNG wewnątrz ICO jest poprawne od Visty.
+// toICO wraps one or more PNGs in an ICO container, which is what the Windows tray and the
+// .exe icon resource require. PNG inside ICO is valid from Vista onwards.
 func toICO(pngs ...[]byte) []byte {
 	var b bytes.Buffer
-	binary.Write(&b, binary.LittleEndian, uint16(0))           // zarezerwowane
-	binary.Write(&b, binary.LittleEndian, uint16(1))           // typ: ikona
-	binary.Write(&b, binary.LittleEndian, uint16(len(pngs)))   // liczba obrazów
+	binary.Write(&b, binary.LittleEndian, uint16(0))         // reserved
+	binary.Write(&b, binary.LittleEndian, uint16(1))         // type: icon
+	binary.Write(&b, binary.LittleEndian, uint16(len(pngs))) // image count
 	offset := 6 + 16*len(pngs)
 
 	for _, p := range pngs {
@@ -352,14 +350,14 @@ func toICO(pngs ...[]byte) []byte {
 		if err != nil {
 			continue
 		}
-		// Wymiar 256 zapisuje się jako 0 — tak mówi specyfikacja ICO i tak wychodzi
-		// z konwersji na bajt.
+		// A dimension of 256 is stored as 0 — that is what the ICO spec says, and what
+		// the conversion to a byte produces anyway.
 		b.WriteByte(byte(cfg.Width))
 		b.WriteByte(byte(cfg.Height))
-		b.WriteByte(0)                                    // paleta: brak
-		b.WriteByte(0)                                    // zarezerwowane
-		binary.Write(&b, binary.LittleEndian, uint16(1))  // płaszczyzny
-		binary.Write(&b, binary.LittleEndian, uint16(32)) // bitów na piksel
+		b.WriteByte(0)                                    // no palette
+		b.WriteByte(0)                                    // reserved
+		binary.Write(&b, binary.LittleEndian, uint16(1))  // planes
+		binary.Write(&b, binary.LittleEndian, uint16(32)) // bits per pixel
 		binary.Write(&b, binary.LittleEndian, uint32(len(p)))
 		binary.Write(&b, binary.LittleEndian, uint32(offset))
 		offset += len(p)
@@ -370,28 +368,44 @@ func toICO(pngs ...[]byte) []byte {
 	return b.Bytes()
 }
 
-// ─── Ikona aplikacji (Dock, Eksplorator, launcher) ────────────────────────────
+// Amber reads on both light and dark trays. On macOS the template mode overrides it anyway
+// and the system picks the colour itself.
+var iconColor = color.RGBA{224, 122, 63, 255}
 
-// Koralowy odcień Claude na tle, biały wskaźnik na wierzchu. Ikona zasobnika jest
-// minimalistyczna z konieczności; ta ma być rozpoznawalna w Docku i na liście aplikacji.
+func setTrayIcon(percent float64) {
+	switch runtime.GOOS {
+	case "darwin":
+		white := drawIcon(percent, color.RGBA{255, 255, 255, 255})
+		systray.SetTemplateIcon(white, white)
+	case "windows":
+		systray.SetIcon(toICO(drawIcon(percent, iconColor)))
+	default:
+		systray.SetIcon(drawIcon(percent, iconColor))
+	}
+}
+
+// ─── Application icon (Dock, Explorer, launcher) ──────────────────────────────
+
+// Claude's coral on the backdrop, a white gauge on top. The tray icon is minimal out of
+// necessity; this one has to stay recognisable in a Dock or an application list.
 var brandBG = color.RGBA{217, 119, 87, 255}
 
-// blend miesza dwa nieprzezroczyste kolory: t=1 daje czysty fg, t=0 czyste bg.
+// blend mixes two opaque colours: t=1 yields pure fg, t=0 pure bg.
 func blend(fg, bg color.RGBA, t float64) color.RGBA {
 	mix := func(a, b uint8) uint8 { return uint8(float64(a)*t + float64(b)*(1-t)) }
 	return color.RGBA{mix(fg.R, bg.R), mix(fg.G, bg.G), mix(fg.B, bg.B), 255}
 }
 
-// appIcon rysuje zaokrąglony kwadrat ze wskaźnikiem zużycia. Próbkowanie 3×3 na piksel
-// wygładza krawędzie — bez tego łuk i narożniki są poszarpane w małych rozmiarach.
+// appIcon draws a rounded square holding a usage gauge. Sampling 3×3 per pixel smooths the
+// edges — without it the arc and the corners look ragged at small sizes.
 func appIcon(size int) []byte {
 	img := image.NewRGBA(image.Rect(0, 0, size, size))
 	s := float64(size)
-	radius := s * 0.225        // promień zaokrąglenia narożników
+	radius := s * 0.225 // corner radius
 	center := s / 2
 	ringOuter := s * 0.32
 	ringInner := s * 0.225
-	const gaugeFrac = 0.68 // pokazowe wypełnienie wskaźnika na ikonie statycznej
+	const gaugeFrac = 0.68 // decorative fill level for the static icon
 
 	inRoundedRect := func(x, y float64) bool {
 		dx := math.Max(math.Max(radius-x, x-(s-radius)), 0)
@@ -410,9 +424,9 @@ func appIcon(size int) []byte {
 					if !inRoundedRect(x, y) {
 						continue
 					}
-					// Każda podpróbka jest nieprzezroczysta — półprzezroczysty łuk mieszamy
-					// z tłem od razu. Dzięki temu krycie niesie wyłącznie informację
-					// o pokryciu piksela, a uśrednianie koloru jest zwykłą średnią.
+					// Every subsample is opaque — the translucent arc is blended with the
+					// backdrop right here. That way alpha carries pixel coverage only, and
+					// averaging the colour is a plain mean.
 					c := brandBG
 					dist := math.Hypot(x-center, y-center)
 					if dist <= ringOuter {
@@ -425,9 +439,9 @@ func appIcon(size int) []byte {
 						case dist >= ringInner && angle <= gaugeFrac*2*math.Pi:
 							c = white
 						case dist >= ringInner:
-							c = blend(white, brandBG, 0.35) // niewypełniona część pierścienia
+							c = blend(white, brandBG, 0.35) // unfilled part of the ring
 						case dist <= ringInner*0.42:
-							c = white // kropka w środku
+							c = white // centre dot
 						}
 					}
 					rr += float64(c.R)
@@ -455,7 +469,7 @@ func appIcon(size int) []byte {
 	return buf.Bytes()
 }
 
-// writeIcons generuje komplet plików ikon do katalogu (PNG w wielu rozmiarach + ICO).
+// writeIcons generates the full icon set (PNGs at several sizes plus an ICO) into a folder.
 func writeIcons(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -472,28 +486,12 @@ func writeIcons(dir string) error {
 	if err := os.WriteFile(filepath.Join(dir, "icon.png"), byPNG[512], 0o644); err != nil {
 		return err
 	}
-	// ICO nie przyjmuje wymiarów powyżej 256.
+	// ICO does not accept dimensions above 256.
 	ico := toICO(byPNG[16], byPNG[32], byPNG[48], byPNG[64], byPNG[128], byPNG[256])
 	return os.WriteFile(filepath.Join(dir, "icon.ico"), ico, 0o644)
 }
 
-// Bursztyn czytelny i na jasnym, i na ciemnym pasku. Na macOS i tak nadpisuje go
-// tryb szablonowy, w którym system sam dobiera kolor.
-var iconColor = color.RGBA{224, 122, 63, 255}
-
-func setTrayIcon(percent float64) {
-	switch runtime.GOOS {
-	case "darwin":
-		white := drawIcon(percent, color.RGBA{255, 255, 255, 255})
-		systray.SetTemplateIcon(white, white)
-	case "windows":
-		systray.SetIcon(toICO(drawIcon(percent, iconColor)))
-	default:
-		systray.SetIcon(drawIcon(percent, iconColor))
-	}
-}
-
-// ─── Stan ─────────────────────────────────────────────────────────────────────
+// ─── State ────────────────────────────────────────────────────────────────────
 
 var (
 	mu         sync.Mutex
@@ -501,13 +499,14 @@ var (
 	baselines  = map[string]map[string]windowState{}
 	fastPolled = map[string]time.Time{}
 	oauthLabel = ""
+	polled     = false // set once the first poll returns, so the menu can say "loading"
 	pollNow    = make(chan struct{}, 1)
 )
 
 func requestPoll() {
 	select {
 	case pollNow <- struct{}{}:
-	default: // odpytanie już zakolejkowane
+	default: // a poll is already queued
 	}
 }
 
@@ -523,7 +522,7 @@ func toReading(name string, u UsageResponse, err error) reading {
 	five, ok1 := parseISO(u.FiveHour.ResetsAt)
 	seven, ok2 := parseISO(u.SevenDay.ResetsAt)
 	if !ok1 || !ok2 {
-		return reading{name: name, err: "nieczytelny znacznik resets_at"}
+		return reading{name: name, err: T().badTimestamp}
 	}
 	r := reading{
 		name:             name,
@@ -556,9 +555,8 @@ func checkReset(name, window, label string, resetsAt time.Time, utilization floa
 
 	if fired && prev != nil {
 		beeep.Notify(
-			name+": limit zresetowany",
-			fmt.Sprintf("%s odświeżone (%s → %s). Następny reset: %s.",
-				label, pct(prev.utilization), pct(utilization), clock(resetsAt)),
+			fmt.Sprintf(T().resetTitle, name),
+			fmt.Sprintf(T().resetBody, label, pct(prev.utilization), pct(utilization), clock(resetsAt)),
 			"")
 	}
 	if baselines[name] == nil {
@@ -567,9 +565,9 @@ func checkReset(name, window, label string, resetsAt time.Time, utilization floa
 	baselines[name][window] = next
 }
 
-// switchOAuthAccount reaguje na zmianę konta zalogowanego w Claude Code. Stary punkt
-// odniesienia dotyczy okna limitów innego konta, więc go porzucamy — nowe konto zaczyna
-// od własnego pierwszego odczytu i nie dostaje fałszywego powiadomienia o resecie.
+// switchOAuthAccount reacts to the account signed into Claude Code being swapped. The old
+// baseline describes a different account's limit window, so it is dropped — the new account
+// starts from its own first reading and never gets a bogus reset notification.
 func switchOAuthAccount(label string) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -587,14 +585,14 @@ func poll() {
 	cfg := loadConfig()
 	var out []reading
 
-	// Konto zalogowane w Claude Code — bez żadnej konfiguracji.
+	// The account signed into Claude Code — no configuration needed.
 	if token := oauthToken(); token != "" {
-		// Etykietę pobieramy przy każdym odpytaniu, bo /login w Claude Code podmienia
-		// konto pod tym samym wpisem w Keychainie. Nazwa jest kluczem stanu, więc bez
-		// tego nowe konto porównywałoby się z punktem odniesienia poprzedniego.
+		// The label is fetched on every poll because /login in Claude Code swaps the
+		// account behind the same Keychain entry. The name keys our state, so without
+		// this a new account would be compared against the previous one's baseline.
 		label := fetchOAuthLabel(token)
 		if label == "" && oauthLabel == "" {
-			label = "Claude Code" // profil niedostępny przy pierwszym odczycie
+			label = "Claude Code" // profile unavailable on the very first reading
 		}
 		if label != "" {
 			switchOAuthAccount(label)
@@ -603,11 +601,11 @@ func poll() {
 		out = append(out, toReading(oauthLabel, u, err))
 	}
 
-	// Dodatkowe konta z configu (sessionKey). Izolowane: wygasły klucz na jednym
-	// nie blokuje pozostałych.
+	// Extra accounts from the config (sessionKey). Isolated: an expired key on one must
+	// not block the others.
 	for _, a := range cfg.Accounts {
 		if a.Name == "" || a.SessionKey == "" || a.OrgID == "" {
-			continue // szkielet z ensureConfig, jeszcze niewypełniony
+			continue // skeleton written by ensureConfig, not filled in yet
 		}
 		u, err := fetchUsageSession(a)
 		out = append(out, toReading(a.Name, u, err))
@@ -615,21 +613,22 @@ func poll() {
 
 	mu.Lock()
 	readings = out
+	polled = true
 	for _, r := range out {
 		if r.err != "" {
 			continue
 		}
-		checkReset(r.name, "five_hour", "okno 5-godzinne", r.fiveHourResetsAt, r.fiveHourPct)
-		checkReset(r.name, "seven_day", "okno 7-dniowe", r.sevenDayResetsAt, r.sevenDayPct)
+		checkReset(r.name, "five_hour", T().fiveHourWindow, r.fiveHourResetsAt, r.fiveHourPct)
+		checkReset(r.name, "seven_day", T().sevenDayWindow, r.sevenDayResetsAt, r.sevenDayPct)
 	}
 	mu.Unlock()
 
 	render()
 }
 
-// fastPollIfResetDue: minął zapamiętany czas resetu — odpytaj od razu, zamiast czekać
-// do końca interwału. Każdy znacznik resets_at wyzwala to dokładnie raz, inaczej konto,
-// dla którego API zwraca nieruchomą przeszłą datę, byłoby odpytywane co minutę bez końca.
+// fastPollIfResetDue: a remembered reset time has passed, so poll straight away instead of
+// waiting out the interval. Each resets_at value triggers this exactly once — otherwise an
+// account whose API keeps returning a stale past date would be polled every minute forever.
 func fastPollIfResetDue() {
 	mu.Lock()
 	defer mu.Unlock()
@@ -649,11 +648,34 @@ func fastPollIfResetDue() {
 
 // ─── Menu ─────────────────────────────────────────────────────────────────────
 
-// systray tworzy pozycje menu raz — nie da się ich usuwać ani przestawiać. Trzymamy
-// więc pulę pozycji i tylko podmieniamy tytuły oraz chowamy nadmiar.
+// systray creates menu items once — they cannot be removed or reordered. So we keep a pool
+// of items and only swap their titles, hiding the surplus.
 const infoSlots = 40
 
-var infoItems []*systray.MenuItem
+var (
+	infoItems  []*systray.MenuItem
+	miRefresh  *systray.MenuItem
+	miOpenCfg  *systray.MenuItem
+	miLanguage *systray.MenuItem
+	miLangs    []*systray.MenuItem
+	miQuit     *systray.MenuItem
+)
+
+// applyLanguage relabels every fixed menu entry. Called at startup and whenever the user
+// picks a different language.
+func applyLanguage() {
+	miRefresh.SetTitle(T().refreshNow)
+	miOpenCfg.SetTitle(T().openConfig)
+	miLanguage.SetTitle(T().language)
+	miQuit.SetTitle(T().quit)
+	for i, item := range miLangs {
+		if languageOrder[i].code == currentLang {
+			item.Check()
+		} else {
+			item.Uncheck()
+		}
+	}
+}
 
 func render() {
 	mu.Lock()
@@ -664,13 +686,17 @@ func render() {
 	worst := -1.0
 	var worstReset time.Time
 
-	if len(snapshot) == 0 {
-		lines = append(lines, "Brak kont — zaloguj się w Claude Code")
-		lines = append(lines, "albo wpisz sessionKey w pliku konfiguracji")
+	switch {
+	case !polled:
+		// Before the first poll returns there is nothing to say — and claiming there are
+		// no accounts would be wrong for the second it takes.
+		lines = append(lines, T().loading)
+	case len(snapshot) == 0:
+		lines = append(lines, T().noAccounts1, T().noAccounts2)
 	}
 	for _, r := range snapshot {
 		if r.err != "" {
-			lines = append(lines, r.name+" — błąd", "   "+r.err)
+			lines = append(lines, r.name+" — "+T().errorWord, "   "+r.err)
 			continue
 		}
 		dot := "○"
@@ -679,13 +705,13 @@ func render() {
 		}
 		lines = append(lines,
 			fmt.Sprintf("%s %s", dot, r.name),
-			fmt.Sprintf("   5h: %s — reset za %s (%s)", pct(r.fiveHourPct), remainingUntil(r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
-			fmt.Sprintf("   7d: %s — reset za %s (%s)", pct(r.sevenDayPct), remainingUntil(r.sevenDayResetsAt), clock(r.sevenDayResetsAt)))
+			fmt.Sprintf(T().fiveHourLine, pct(r.fiveHourPct), remainingUntil(r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
+			fmt.Sprintf(T().sevenDayLine, pct(r.sevenDayPct), remainingUntil(r.sevenDayResetsAt), clock(r.sevenDayResetsAt)))
 		if r.opusPct != nil {
-			lines = append(lines, "   7d Opus: "+pct(*r.opusPct))
+			lines = append(lines, fmt.Sprintf(T().opusLine, pct(*r.opusPct)))
 		}
 		if r.sonnetPct != nil {
-			lines = append(lines, "   7d Sonnet: "+pct(*r.sonnetPct))
+			lines = append(lines, fmt.Sprintf(T().sonnetLine, pct(*r.sonnetPct)))
 		}
 		if r.fiveHourPct > worst {
 			worst, worstReset = r.fiveHourPct, r.fiveHourResetsAt
@@ -704,13 +730,13 @@ func render() {
 	title := "Claude ⚙︎"
 	if worst >= 0 {
 		if worst >= 100 {
-			// Przy wyczerpanym oknie liczy się już tylko to, kiedy wróci.
+			// Once a window is exhausted the only thing that matters is when it returns.
 			title = "Claude ⏳ " + remainingUntil(worstReset)
 		} else {
 			title = "Claude " + pct(worst)
 		}
 	}
-	// Tekst obok ikony pokazuje tylko macOS; na Windows i Linux niesie go podpowiedź.
+	// Only macOS shows text next to the icon; on Windows and Linux the tooltip carries it.
 	systray.SetTitle(title)
 	systray.SetTooltip(title)
 	setTrayIcon(math.Max(0, worst))
@@ -719,13 +745,13 @@ func render() {
 func onReady() {
 	setTrayIcon(0)
 	systray.SetTitle("Claude ⚙︎")
-	systray.SetTooltip("ClaudeResetBar")
+	systray.SetTooltip(T().tooltipIdle)
 
 	for i := 0; i < infoSlots; i++ {
 		item := systray.AddMenuItem("", "")
 		item.Disable()
 		item.Hide()
-		// Kanał kliknięć trzeba opróżniać, inaczej może zablokować pętlę systray.
+		// The click channel has to be drained or it can block the systray loop.
 		go func(it *systray.MenuItem) {
 			for range it.ClickedCh {
 			}
@@ -734,25 +760,44 @@ func onReady() {
 	}
 
 	systray.AddSeparator()
-	refresh := systray.AddMenuItem("Odśwież teraz", "")
-	openCfg := systray.AddMenuItem("Otwórz plik konfiguracji", "")
+	miRefresh = systray.AddMenuItem("", "")
+	miOpenCfg = systray.AddMenuItem("", "")
+	miLanguage = systray.AddMenuItem("", "")
+	for _, l := range languageOrder {
+		miLangs = append(miLangs, miLanguage.AddSubMenuItemCheckbox(l.name, "", l.code == currentLang))
+	}
 	systray.AddSeparator()
-	quit := systray.AddMenuItem("Zakończ", "")
+	miQuit = systray.AddMenuItem("", "")
+	applyLanguage()
 
 	go func() {
 		for {
 			select {
-			case <-refresh.ClickedCh:
+			case <-miRefresh.ClickedCh:
 				requestPoll()
-			case <-openCfg.ClickedCh:
+			case <-miOpenCfg.ClickedCh:
 				ensureConfig()
 				openInEditor(configPath())
-			case <-quit.ClickedCh:
+			case <-miQuit.ClickedCh:
 				systray.Quit()
 				return
 			}
 		}
 	}()
+
+	// One goroutine per language entry — a shared select would need reflection.
+	for i, item := range miLangs {
+		go func(idx int, it *systray.MenuItem) {
+			for range it.ClickedCh {
+				currentLang = languageOrder[idx].code
+				if err := saveLanguage(currentLang); err != nil {
+					fmt.Fprintln(os.Stderr, "could not save language:", err)
+				}
+				applyLanguage()
+				render()
+			}
+		}(i, item)
+	}
 
 	go loop()
 	requestPoll()
@@ -764,8 +809,8 @@ func loop() {
 	if minutes < 1 {
 		minutes = 15
 	}
-	// Odpytywanie API jest rzadkie, bo limity zmieniają się wolno. Osobny, częsty tick
-	// tylko przelicza odliczanie z zapamiętanych resets_at, żeby menu nie stało w miejscu.
+	// Polling the API is infrequent because limits move slowly. A separate, frequent tick
+	// only recomputes countdowns from the cached resets_at so the menu never goes stale.
 	apiTick := time.NewTicker(time.Duration(minutes) * time.Minute)
 	uiTick := time.NewTicker(time.Minute)
 	defer apiTick.Stop()
@@ -797,76 +842,109 @@ func runSelfCheck() {
 	now := time.Now()
 	plus5h := now.Add(5 * time.Hour)
 
-	// Pierwszy odczyt tylko ustawia punkt odniesienia.
+	// The first reading only records a baseline.
 	fired, base := detectReset(nil, now, 80)
-	assert(!fired, "pierwszy odczyt nie powiadamia")
-	assert(base.resetsAt.Equal(now), "pierwszy odczyt zapisuje znacznik")
+	assert(!fired, "first reading does not notify")
+	assert(base.resetsAt.Equal(now), "first reading stores the timestamp")
 
-	// Ten sam znacznik = brak resetu.
+	// The same timestamp is not a reset.
 	fired, _ = detectReset(&base, now, 95)
-	assert(!fired, "ten sam znacznik to nie reset")
+	assert(!fired, "an unchanged timestamp is not a reset")
 
-	// Skok o 5h = reset.
+	// A 5-hour jump is a reset.
 	fired, next := detectReset(&base, plus5h, 0)
-	assert(fired, "skok o 5h to reset")
-	assert(next.resetsAt.Equal(plus5h), "reset zapisuje nowy znacznik")
+	assert(fired, "a 5-hour jump is a reset")
+	assert(next.resetsAt.Equal(plus5h), "a reset stores the new timestamp")
 
-	// Drobne przesunięcie poniżej progu 1h = nie reset.
+	// Drift below the 1-hour threshold is not a reset.
 	fired, _ = detectReset(&base, now.Add(10*time.Minute), 81)
-	assert(!fired, "przesunięcie o 10 min to nie reset")
+	assert(!fired, "a 10-minute shift is not a reset")
 
-	// Epoka z API nie może zatruć punktu odniesienia.
+	// An epoch timestamp must not poison the baseline.
 	_, kept := detectReset(&base, time.Unix(0, 0), 0)
-	assert(kept.resetsAt.Equal(base.resetsAt), "epoka nie nadpisuje punktu odniesienia")
+	assert(kept.resetsAt.Equal(base.resetsAt), "the epoch does not overwrite the baseline")
 
-	assert(remaining(-5) == "teraz", "ujemny czas")
-	assert(remaining(3*3600+120) == "3h 2m", "godziny i minuty")
-	assert(remaining(45*60) == "45m", "same minuty")
-	assert(remaining(3*86400+4*3600) == "3d 4h", "dni i godziny")
+	// Duration formatting, in whichever language is active.
+	currentLang = "en"
+	assert(remaining(-5) == "now", "negative duration")
+	assert(remaining(3*3600+120) == "3h 2m", "hours and minutes")
+	assert(remaining(45*60) == "45m", "minutes only")
+	assert(remaining(3*86400+4*3600) == "3d 4h", "days and hours")
+	currentLang = "pl"
+	assert(remaining(-5) == "teraz", "negative duration translates")
+	currentLang = "en"
 
-	// Ikona musi być poprawnym PNG-iem, a kontener ICO musi go wskazywać.
+	// Language resolution: config wins, then the locale, then English. Every locale
+	// variable is cleared first so the result does not depend on the developer's shell.
+	for _, env := range []string{"LC_ALL", "LC_MESSAGES", "LANG"} {
+		os.Unsetenv(env)
+	}
+	assert(resolveLanguage("pl") == "pl", "explicit language from the config")
+	assert(resolveLanguage("de") == "en", "unknown code falls back to English")
+	assert(resolveLanguage("") == "en", "no locale at all falls back to English")
+	os.Setenv("LC_ALL", "pl_PL.UTF-8")
+	assert(resolveLanguage("") == "pl", "locale is honoured")
+	assert(resolveLanguage("en") == "en", "config overrides the locale")
+	os.Setenv("LC_ALL", "de_DE.UTF-8")
+	assert(resolveLanguage("auto") == "en", "unsupported locale falls back to English")
+	os.Unsetenv("LC_ALL")
+
+	// Every language must define every string, or the menu shows blanks.
+	for code, l := range languages {
+		assert(l.refreshNow != "" && l.quit != "" && l.language != "" && l.now != "",
+			"language "+code+" defines its menu strings")
+		assert(l.resetTitle != "" && l.resetBody != "" && l.fiveHourLine != "",
+			"language "+code+" defines its message templates")
+		for _, d := range l.days {
+			assert(d != "", "language "+code+" defines all weekday names")
+		}
+	}
+
+	// The tray icon must be a valid PNG, and the ICO container must point at it.
 	raw := drawIcon(42, iconColor)
 	cfg, err := png.DecodeConfig(bytes.NewReader(raw))
-	assert(err == nil, "ikona dekoduje się jako PNG")
-	assert(cfg.Width == iconSize && cfg.Height == iconSize, "ikona ma zadany rozmiar")
+	assert(err == nil, "the icon decodes as PNG")
+	assert(cfg.Width == iconSize && cfg.Height == iconSize, "the icon has the requested size")
 	ico := toICO(raw)
-	assert(len(ico) == 22+len(raw), "ICO ma nagłówek 22 bajtów")
-	assert(bytes.Equal(ico[22:], raw), "ICO zawiera PNG w całości")
+	assert(len(ico) == 22+len(raw), "an ICO header is 22 bytes")
+	assert(bytes.Equal(ico[22:], raw), "the ICO carries the whole PNG")
 
-	// ICO z wieloma obrazami: nagłówek 6 B + 16 B na wpis, potem dane po kolei.
+	// Multi-image ICO: 6-byte header plus 16 bytes per entry, then the payloads in order.
 	a16, a32 := appIcon(16), appIcon(32)
 	multi := toICO(a16, a32)
-	assert(len(multi) == 6+2*16+len(a16)+len(a32), "wielorozmiarowe ICO ma poprawną długość")
-	assert(multi[4] == 2 && multi[5] == 0, "ICO deklaruje dwa obrazy")
-	assert(multi[6] == 16 && multi[6+16] == 32, "wpisy ICO mają właściwe wymiary")
-	// Offset pierwszego obrazu musi wskazywać tuż za katalog wpisów.
-	assert(bytes.Equal(multi[6+2*16:6+2*16+len(a16)], a16), "pierwszy obraz leży pod swoim offsetem")
+	assert(len(multi) == 6+2*16+len(a16)+len(a32), "a multi-size ICO has the right length")
+	assert(multi[4] == 2 && multi[5] == 0, "the ICO declares two images")
+	assert(multi[6] == 16 && multi[6+16] == 32, "the ICO entries carry the right dimensions")
+	assert(bytes.Equal(multi[6+2*16:6+2*16+len(a16)], a16), "the first image sits at its offset")
 
-	// Ikona aplikacji: 256 px zapisuje się w ICO jako 0.
+	// Application icon: 256 px is written as 0 in an ICO.
 	big := appIcon(256)
 	bigCfg, err := png.DecodeConfig(bytes.NewReader(big))
-	assert(err == nil && bigCfg.Width == 256, "ikona 256 px dekoduje się")
-	assert(toICO(big)[6] == 0, "wymiar 256 zapisany jako 0")
+	assert(err == nil && bigCfg.Width == 256, "the 256 px icon decodes")
+	assert(toICO(big)[6] == 0, "a dimension of 256 is stored as 0")
 
-	// Narożnik zaokrąglonego kwadratu musi być przezroczysty, a środek pełny.
+	// The rounded square must be transparent at the corner and solid in the middle.
 	corner, _ := png.Decode(bytes.NewReader(appIcon(64)))
 	_, _, _, cornerA := corner.At(0, 0).RGBA()
 	_, _, _, centerA := corner.At(32, 32).RGBA()
-	assert(cornerA == 0, "narożnik ikony jest przezroczysty")
-	assert(centerA == 0xffff, "środek ikony jest pełny")
+	assert(cornerA == 0, "the icon corner is transparent")
+	assert(centerA == 0xffff, "the icon centre is solid")
 
-	// 0% i 100% nie mogą się wysypać na krawędziach kąta.
-	assert(len(drawIcon(0, iconColor)) > 0 && len(drawIcon(100, iconColor)) > 0, "skrajne wartości")
+	// Extreme values must not break at the angle boundaries.
+	assert(len(drawIcon(0, iconColor)) > 0 && len(drawIcon(100, iconColor)) > 0, "extreme values")
 
-	// Konfiguracja claude-reset (z BOM-em i webhookiem) musi się wczytać.
+	// A claude-reset config, webhook and all, must still parse.
 	var parsed Config
 	err = json.Unmarshal([]byte(`{"accounts":[{"name":"a","session_key":"k","org_id":"o"}],`+
-		`"slack_webhook_url":"https://x","check_interval_minutes":5}`), &parsed)
-	assert(err == nil && len(parsed.Accounts) == 1 && parsed.CheckIntervalMinutes == 5, "config claude-reset")
+		`"slack_webhook_url":"https://x","check_interval_minutes":5,"language":"pl"}`), &parsed)
+	assert(err == nil && len(parsed.Accounts) == 1 && parsed.CheckIntervalMinutes == 5,
+		"a claude-reset config parses")
+	assert(parsed.Language == "pl", "the language setting is read")
 
-	// Token wyciągany z obu układów pliku poświadczeń.
-	assert(tokenFromJSON([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}`)) == "sk-ant-oat01-x", "token z JSON-a")
-	assert(tokenFromJSON([]byte(`{"mcpOAuth":{}}`)) == "", "brak tokenu gdy nie ma sekcji")
+	// The token is found in the credentials layout, and absent when the section is missing.
+	assert(tokenFromJSON([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}`)) == "sk-ant-oat01-x",
+		"the token is read from JSON")
+	assert(tokenFromJSON([]byte(`{"mcpOAuth":{}}`)) == "", "no token when the section is missing")
 
 	fmt.Println("self-check OK")
 }
@@ -876,24 +954,27 @@ func main() {
 		runSelfCheck()
 		return
 	}
-	// Generowanie ikon aplikacji do repo/paczek releasowych.
+	currentLang = resolveLanguage(loadConfig().Language)
+
+	// Generates the application icon set for the repository and release packages.
 	if len(os.Args) > 2 && os.Args[1] == "--icons" {
 		if err := writeIcons(os.Args[2]); err != nil {
-			fmt.Fprintln(os.Stderr, "nie udało się zapisać ikon:", err)
+			fmt.Fprintln(os.Stderr, "could not write icons:", err)
 			os.Exit(1)
 		}
-		fmt.Println("ikony zapisane w", os.Args[2])
+		fmt.Println("icons written to", os.Args[2])
 		return
 	}
-	// Sprawdzenie, czy powiadomienia w ogóle przechodzą na tym systemie — bez czekania
-	// na prawdziwy reset. Na Linuksie wymaga działającego demona powiadomień.
+	// Checks whether notifications get through on this system at all, without waiting for
+	// a real reset. On Linux this needs a running notification daemon.
 	if len(os.Args) > 1 && os.Args[1] == "--notify" {
-		if err := beeep.Notify("ClaudeResetBar", "Powiadomienia działają.", ""); err != nil {
-			fmt.Fprintln(os.Stderr, "powiadomienie nie przeszło:", err)
+		if err := beeep.Notify("ClaudeResetBar", T().notifyWorks, ""); err != nil {
+			fmt.Fprintln(os.Stderr, "the notification did not get through:", err)
 			os.Exit(1)
 		}
-		fmt.Println("powiadomienie wysłane")
+		fmt.Println("notification sent")
 		return
 	}
+
 	systray.Run(onReady, func() {})
 }

@@ -1,21 +1,21 @@
 #!/bin/bash
-# Buduje ClaudeResetBar.app. Bez zależności — wystarczy Xcode Command Line Tools.
+# Builds ClaudeResetBar.app. No dependencies — Xcode Command Line Tools are enough.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="$DIR/build/ClaudeResetBar.app"
 
-# Self-check logiki wykrywania resetu — build nie przechodzi, jeśli assert padnie.
-swiftc -Onone "$DIR/src/main.swift" -o "$DIR/build/.selfcheck" -module-name ClaudeResetBar 2>/dev/null \
-  || { mkdir -p "$DIR/build"; swiftc -Onone "$DIR/src/main.swift" -o "$DIR/build/.selfcheck" -module-name ClaudeResetBar; }
+# Self-check of the reset-detection logic — the build fails if an assertion trips.
+swiftc -Onone "$DIR/src/"*.swift -o "$DIR/build/.selfcheck" -module-name ClaudeResetBar 2>/dev/null \
+  || { mkdir -p "$DIR/build"; swiftc -Onone "$DIR/src/"*.swift -o "$DIR/build/.selfcheck" -module-name ClaudeResetBar; }
 "$DIR/build/.selfcheck" --test
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O "$DIR/src/main.swift" -o "$APP/Contents/MacOS/ClaudeResetBar" -module-name ClaudeResetBar
+swiftc -O "$DIR/src/"*.swift -o "$APP/Contents/MacOS/ClaudeResetBar" -module-name ClaudeResetBar
 
-# Ikona aplikacji. Zestaw PNG-ów generuje `cross/claude-reset-bar --icons assets`;
-# iconutil składa z nich .icns, którego wymaga Finder i Dock.
+# Application icon. The PNG set comes from `cross/claude-reset-bar --icons assets`;
+# iconutil assembles the .icns that Finder and the Dock require.
 if [ -f "$DIR/assets/icon_1024.png" ]; then
     ICONSET="$DIR/build/AppIcon.iconset"
     rm -rf "$ICONSET"; mkdir -p "$ICONSET"
@@ -50,4 +50,4 @@ PLIST
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 rm -f "$DIR/build/.selfcheck"
 
-echo "Zbudowano: $APP"
+echo "Built: $APP"
