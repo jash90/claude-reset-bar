@@ -9,7 +9,7 @@ A menu bar / system tray icon that shows your Claude usage limits and **notifies
 - **macOS, Windows, Linux.** One binary per system, no runtime, no installer.
 
 ```
-you@example.com   · in use
+● you@example.com
    5h: 39% — resets in 15m (Mon 11:29)
    7d: 23% — resets in 5d 13h (Sun 00:59)
 ```
@@ -58,10 +58,10 @@ The account signed into Claude Code shows up on its own. Switching accounts with
 Rather than dropping its row, the app keeps the last reading it got, marked with the time it was taken:
 
 ```
-new@example.com   · in use
+● new@example.com
    5h: 2% — resets in 4h 47m (Mon 16:29)
 
-old@example.com   · last seen 12:03
+○ old@example.com   · last seen 12:03
    5h: 40% — resets in 2h 14m (Mon 14:03)
 ```
 

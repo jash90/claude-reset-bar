@@ -483,12 +483,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateTitle() {
         guard !sourceNames.isEmpty else {
-            statusItem.button?.title = "Claude —"
+            statusItem.button?.title = "Claude ⚙︎"
             return
         }
         let live = readings.values.filter { $0.error == nil && $0.lastSeen == nil }
         guard let worst = live.max(by: { $0.fiveHourPct < $1.fiveHourPct }) else {
-            statusItem.button?.title = "Claude !"
+            statusItem.button?.title = "Claude ⚠︎"
             return
         }
         // Once a window is exhausted the only thing that matters is when it returns.
@@ -520,15 +520,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 continue
             }
             // One menu item per line — NSMenuItem does not wrap a title on "\n".
-            // Status is spelled out rather than carried by a glyph, so the menu stays plain
-            // text and reads the same in every font and screen reader.
             var label = name
             if let seen = r.lastSeen {
                 label += String(format: T.lastSeen, clockFormatter.string(from: seen))
-            } else if r.active {
-                label += T.activeSuffix
             }
-            var lines = [label,
+            var lines = ["\(r.active && r.lastSeen == nil ? "●" : "○") \(label)",
                          String(format: T.fiveHourLine, pct(r.fiveHourPct),
                                 remaining(until: r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
                          String(format: T.sevenDayLine, pct(r.sevenDayPct),

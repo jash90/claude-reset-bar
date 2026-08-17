@@ -6,11 +6,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 mkdir -p build
 
-# The interface is deliberately plain text. Fail the build if a pictographic character
-# creeps back into the sources, where it would render inconsistently across fonts,
-# terminals and screen readers.
-if grep -n '[⚙⏳⚠●○️︎]' "$DIR"/../src/*.swift "$DIR"/*.go "$DIR"/../README.md 2>/dev/null; then
-    echo "Pictographic characters found in the sources listed above." >&2
+# The hourglass is deliberately absent: the exhausted-window title spells out the
+# remaining time instead, which stays legible where the glyph does not render.
+if grep -n '⏳' "$DIR"/../src/*.swift "$DIR"/*.go "$DIR"/../README.md 2>/dev/null; then
+    echo "Hourglass character found in the sources listed above." >&2
     exit 1
 fi
 

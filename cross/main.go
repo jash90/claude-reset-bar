@@ -745,17 +745,16 @@ func render() {
 			lines = append(lines, r.name+" — "+T().errorWord, "   "+r.err)
 			continue
 		}
-		// Status is spelled out rather than carried by a glyph, so the menu stays plain
-		// text and reads the same in every font and screen reader.
+		dot := "○"
+		if r.active && r.lastSeen.IsZero() {
+			dot = "●"
+		}
 		name := r.name
-		switch {
-		case !r.lastSeen.IsZero():
+		if !r.lastSeen.IsZero() {
 			name += fmt.Sprintf(T().lastSeen, timeOfDay(r.lastSeen))
-		case r.active:
-			name += T().activeSuffix
 		}
 		lines = append(lines,
-			name,
+			fmt.Sprintf("%s %s", dot, name),
 			fmt.Sprintf(T().fiveHourLine, pct(r.fiveHourPct), remainingUntil(r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
 			fmt.Sprintf(T().sevenDayLine, pct(r.sevenDayPct), remainingUntil(r.sevenDayResetsAt), clock(r.sevenDayResetsAt)))
 		if r.opusPct != nil {
@@ -780,7 +779,7 @@ func render() {
 		}
 	}
 
-	title := "Claude —"
+	title := "Claude ⚙︎"
 	if worst >= 0 {
 		title = "Claude " + pct(worst)
 		if worst >= 100 {
@@ -796,7 +795,7 @@ func render() {
 
 func onReady() {
 	setTrayIcon(0)
-	systray.SetTitle("Claude —")
+	systray.SetTitle("Claude ⚙︎")
 	systray.SetTooltip(T().tooltipIdle)
 
 	for i := 0; i < infoSlots; i++ {

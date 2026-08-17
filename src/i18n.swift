@@ -13,7 +13,6 @@ struct UIStrings {
     let loading: String
     let errorWord: String
     let now: String
-    let activeSuffix: String   // appended to the name of an account in use right now
     let lastSeen: String   // "   · last seen %@", appended to an unreachable account's name
     let days: [String]
 
@@ -56,7 +55,6 @@ let languages: [String: UIStrings] = [
         loading: "loading…",
         errorWord: "error",
         now: "now",
-        activeSuffix: "   · in use",
         lastSeen: "   · last seen %@",
         days: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
 
@@ -98,7 +96,6 @@ let languages: [String: UIStrings] = [
         loading: "ładowanie…",
         errorWord: "błąd",
         now: "teraz",
-        activeSuffix: "   · w użyciu",
         lastSeen: "   · ostatnio widziane %@",
         days: ["niedz.", "pon.", "wt.", "śr.", "czw.", "pt.", "sob."],
 
