@@ -58,20 +58,37 @@ if [ "$(uname)" = "Darwin" ]; then
 
     # Notarization. Apple inspects the signed bundle and issues a ticket; stapling writes
     # that ticket into the app, so the first launch is an ordinary double-click even on a
-    # machine that cannot reach Apple's service. It needs credentials stored once:
+    # machine that cannot reach Apple's service. The app is submitted as a zip: notarytool
+    # mounts a .dmg to inspect it, and a mount left behind by an interrupted run wedges
+    # every attempt after it.
+    #
+    # Credentials come either from an App Store Connect API key — the route the other
+    # projects here use, and the one that survives an Apple ID password change:
+    #   APPLE_API_KEY_ID=XXXXXXXXXX APPLE_API_ISSUER=<uuid> ./release.sh v1.0.0
+    # (the key itself is looked up in ~/private_keys and ~/.appstoreconnect/private_keys,
+    # or named with APPLE_API_KEY_PATH) — or from a stored notarytool profile:
     #   xcrun notarytool store-credentials claude-reset-bar \
     #     --apple-id you@example.com --team-id TEAMID --password app-specific-password
-    # Without them the release still ships, signed but unnotarized.
-    PROFILE="${NOTARY_PROFILE:-claude-reset-bar}"
-    if xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1; then
+    # With neither, the release still ships, signed but unnotarized.
+    NOTARY_ARGS=""
+    if [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ]; then
+        KEY="${APPLE_API_KEY_PATH:-$HOME/private_keys/AuthKey_$APPLE_API_KEY_ID.p8}"
+        [ -f "$KEY" ] || KEY="$HOME/.appstoreconnect/private_keys/AuthKey_$APPLE_API_KEY_ID.p8"
+        NOTARY_ARGS="--key $KEY --key-id $APPLE_API_KEY_ID --issuer $APPLE_API_ISSUER"
+    elif xcrun notarytool history --keychain-profile "${NOTARY_PROFILE:-claude-reset-bar}" >/dev/null 2>&1; then
+        NOTARY_ARGS="--keychain-profile ${NOTARY_PROFILE:-claude-reset-bar}"
+    fi
+
+    if [ -n "$NOTARY_ARGS" ]; then
         echo "── notarization ─────────────────────────────────────"
-        xcrun notarytool submit "$ZIP" --keychain-profile "$PROFILE" --wait
+        xcrun notarytool submit "$ZIP" $NOTARY_ARGS --wait --timeout 30m
         xcrun stapler staple "$APP"
+        xcrun stapler validate "$APP"
         rm -f "$ZIP"
         ditto -c -k --keepParent "$APP" "$ZIP"
         spctl -a -vvv "$APP"
     else
-        echo "── notarization skipped (no '$PROFILE' notarytool profile) ──"
+        echo "── notarization skipped (no App Store Connect key, no notarytool profile) ──"
     fi
 else
     echo "── macOS package skipped (only builds on macOS) ─────"

@@ -23,7 +23,7 @@ Each window carries a fill gauge alongside the number, so you can judge how much
 
 Grab the package for your system from [Releases](../../releases).
 
-**macOS** — unzip and drag `ClaudeResetBar.app` into `/Applications`. The app is not signed with an Apple certificate, so Gatekeeper blocks the first launch: right-click → *Open*, or confirm *Open Anyway* under *System Settings → Privacy & Security*.
+**macOS** — unzip and drag `ClaudeResetBar.app` into `/Applications`, then open it. The app is signed with a Developer ID certificate and notarized by Apple, with the ticket stapled into the bundle, so it launches on a double-click and Gatekeeper stays quiet even on a machine that is offline.
 
 **Windows** — unzip and run `claude-reset-bar.exe`. SmartScreen will warn about an unknown publisher (no code signature): *More info* → *Run anyway*.
 
