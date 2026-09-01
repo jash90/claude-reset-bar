@@ -209,25 +209,74 @@ func fetchUsage(_ account: Account, completion: @escaping (Result<UsageResponse,
 
 // MARK: - The Claude Code account (OAuth token from the Keychain)
 
-// Claude Code stores its subscription token in the Keychain under "Claude Code-credentials"
-// and refreshes it itself. We re-read it on every poll, so a refresh performed by Claude Code
-// is picked up immediately. We deliberately do NOT use the refresh token — refreshing it
-// ourselves would invalidate Claude Code's own session.
-func keychainOAuthToken() -> String? {
+// Claude Code stores its subscription token in the Keychain and refreshes it itself. We
+// re-read it on every poll, so a refresh performed by Claude Code is picked up immediately.
+// We deliberately do NOT use the refresh token — refreshing it ourselves would invalidate
+// Claude Code's own session.
+
+/// One `security find-generic-password` lookup. Returns nothing when the item is absent.
+func keychainSecret(service: String, account: String?) -> Data? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-    p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+    var args = ["find-generic-password", "-s", service]
+    if let account { args += ["-a", account] }
+    args.append("-w")
+    p.arguments = args
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = FileHandle.nullDevice
     guard (try? p.run()) != nil else { return nil }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let oauth = json["claudeAiOauth"] as? [String: Any],
-          let token = oauth["accessToken"] as? String, !token.isEmpty
-    else { return nil }
-    return token
+    return p.terminationStatus == 0 && !data.isEmpty ? data : nil
+}
+
+/// Every Keychain service that may hold Claude Code credentials: the plain name plus the
+/// per-profile "Claude Code-credentials-<hash>" variants. Listing them costs one cheap
+/// `dump-keychain` — it reads attributes only, never a secret, so it prompts for nothing.
+func keychainCredentialServices() -> [String] {
+    let base = "Claude Code-credentials"
+    var services = [base]
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = ["dump-keychain"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return services }
+    let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    p.waitUntilExit()
+    for line in out.split(separator: "\n") where line.contains("\"svce\"") {
+        guard let open = line.range(of: "=\""), let close = line.range(of: "\"", options: .backwards),
+              open.upperBound < close.lowerBound else { continue }
+        let name = String(line[open.upperBound..<close.lowerBound])
+        if name.hasPrefix(base) && !services.contains(name) { services.append(name) }
+    }
+    return services
+}
+
+/// The subscription token, picked out of every Keychain item that could carry one.
+///
+/// Several items share the service name: Claude Code writes one per profile, and an MCP
+/// OAuth flow writes its own under account "unknown" holding only `mcpOAuth`. Asking
+/// `security` for a service alone returns whichever it happens to find first, which since
+/// 2026-08 is often the MCP one — that is how the app went blank while Claude Code itself
+/// stayed signed in. So we read them all and keep the token that expires last.
+func keychainOAuthToken() -> String? {
+    var best: (expiry: Double, token: String)?
+    let accounts: [String?] = [NSUserName(), nil]
+    for service in keychainCredentialServices() {
+        for account in accounts {
+            guard let data = keychainSecret(service: service, account: account),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let oauth = json["claudeAiOauth"] as? [String: Any],
+                  let token = oauth["accessToken"] as? String, !token.isEmpty
+            else { continue }
+            let expiry = (oauth["expiresAt"] as? Double) ?? 0
+            if best == nil || expiry > best!.expiry { best = (expiry, token) }
+        }
+    }
+    return best?.token
 }
 
 func anthropicRequest(path: String, token: String) -> URLRequest {

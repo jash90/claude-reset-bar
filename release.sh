@@ -48,12 +48,31 @@ done
 # macOS only builds on macOS — AppKit needs CGO and the local SDK.
 if [ "$(uname)" = "Darwin" ]; then
     echo "── macOS package ────────────────────────────────────"
-    "$DIR/build.sh" >/dev/null
+    VERSION="$VERSION" "$DIR/build.sh" >/dev/null
+    APP="$DIR/build/ClaudeResetBar.app"
+    ZIP="$DIST/ClaudeResetBar-$VERSION-macos-arm64.zip"
     # ditto preserves bundle attributes that a plain zip drops. We pack the .app alone —
     # without --sequesterRsrc, which adds a __MACOSX folder, and with the parent named
     # explicitly so extraction yields the app itself, not the staging directory.
-    ditto -c -k --keepParent "$DIR/build/ClaudeResetBar.app" \
-        "$DIST/ClaudeResetBar-$VERSION-macos-arm64.zip"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+
+    # Notarization. Apple inspects the signed bundle and issues a ticket; stapling writes
+    # that ticket into the app, so the first launch is an ordinary double-click even on a
+    # machine that cannot reach Apple's service. It needs credentials stored once:
+    #   xcrun notarytool store-credentials claude-reset-bar \
+    #     --apple-id you@example.com --team-id TEAMID --password app-specific-password
+    # Without them the release still ships, signed but unnotarized.
+    PROFILE="${NOTARY_PROFILE:-claude-reset-bar}"
+    if xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1; then
+        echo "── notarization ─────────────────────────────────────"
+        xcrun notarytool submit "$ZIP" --keychain-profile "$PROFILE" --wait
+        xcrun stapler staple "$APP"
+        rm -f "$ZIP"
+        ditto -c -k --keepParent "$APP" "$ZIP"
+        spctl -a -vvv "$APP"
+    else
+        echo "── notarization skipped (no '$PROFILE' notarytool profile) ──"
+    fi
 else
     echo "── macOS package skipped (only builds on macOS) ─────"
 fi

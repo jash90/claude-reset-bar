@@ -19,8 +19,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	osuser "os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -217,13 +219,63 @@ func oauthToken() string {
 		}
 	}
 	if runtime.GOOS == "darwin" {
-		out, err := exec.Command("/usr/bin/security",
-			"find-generic-password", "-s", "Claude Code-credentials", "-w").Output()
-		if err == nil {
-			return tokenFromJSON(bytes.TrimSpace(out))
+		return keychainToken()
+	}
+	return ""
+}
+
+// keychainToken reads the token out of every Keychain item that could carry one. Several
+// items share the service name "Claude Code-credentials": Claude Code writes one per
+// profile (plus "-<hash>" variants), and an MCP OAuth flow writes its own under account
+// "unknown" holding no subscription token at all. Asking for a service alone returns
+// whichever item comes first, so we read them all and keep the first real token.
+func keychainToken() string {
+	username := ""
+	if u, err := osuser.Current(); err == nil {
+		username = u.Username
+	}
+	for _, service := range keychainCredentialServices() {
+		for _, account := range []string{username, ""} {
+			args := []string{"find-generic-password", "-s", service}
+			if account != "" {
+				args = append(args, "-a", account)
+			}
+			out, err := exec.Command("/usr/bin/security", append(args, "-w")...).Output()
+			if err != nil {
+				continue
+			}
+			if tok := tokenFromJSON(bytes.TrimSpace(out)); tok != "" {
+				return tok
+			}
 		}
 	}
 	return ""
+}
+
+// keychainCredentialServices lists the "Claude Code-credentials" services present. The dump
+// reads attributes only, never a secret, so it prompts for nothing.
+func keychainCredentialServices() []string {
+	const base = "Claude Code-credentials"
+	services := []string{base}
+	out, err := exec.Command("/usr/bin/security", "dump-keychain").Output()
+	if err != nil {
+		return services
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, `"svce"`) {
+			continue
+		}
+		start := strings.Index(line, `="`)
+		end := strings.LastIndex(line, `"`)
+		if start < 0 || end <= start+2 {
+			continue
+		}
+		name := line[start+2 : end]
+		if strings.HasPrefix(name, base) && !slices.Contains(services, name) {
+			services = append(services, name)
+		}
+	}
+	return services
 }
 
 // ─── HTTP clients ─────────────────────────────────────────────────────────────

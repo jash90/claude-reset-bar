@@ -36,7 +36,10 @@ if [ -f "$DIR/assets/icon_1024.png" ]; then
     rm -rf "$ICONSET"
 fi
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# The bundle carries the release number when one is given: VERSION=v1.4.1 ./build.sh
+BUNDLE_VERSION="$(printf '%s' "${VERSION:-1.0}" | sed 's/^v//')"
+
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -45,8 +48,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>ClaudeResetBar</string>
   <key>CFBundleIdentifier</key><string>local.claude-reset-bar</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleVersion</key><string>1.0</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>${BUNDLE_VERSION}</string>
+  <key>CFBundleShortVersionString</key><string>${BUNDLE_VERSION}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
@@ -54,7 +57,23 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# Signature. With a Developer ID certificate on the machine the download carries a real
+# developer name and passes Gatekeeper's signature check; without one the ad-hoc signature
+# still lets the app run locally. Set CODESIGN_IDENTITY to pick a specific certificate.
+# The certificate is named by its SHA-1 hash, not its common name — a machine that has
+# renewed the certificate holds two with the same name, and codesign refuses that as
+# ambiguous.
+IDENTITY="${CODESIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk '/Developer ID Application/ { print $2; exit }')}"
+if [ -n "$IDENTITY" ]; then
+    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+    echo "Signed: $IDENTITY"
+else
+    codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+    echo "Signed ad-hoc — no Developer ID certificate on this machine."
+fi
+codesign --verify --strict --verbose=1 "$APP"
+
 rm -f "$DIR/build/.selfcheck"
 
 echo "Built: $APP"
