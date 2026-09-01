@@ -27,9 +27,12 @@ struct Config: Codable {
     var accountList: [Account] { accounts ?? [] }
 }
 
+// Every field is optional. The API has already moved one reading out of its dedicated
+// field once (the per-model caps), and a null arriving where a number used to be should
+// cost one row, not the whole account.
 struct UsageWindow: Codable {
-    let utilization: Double
-    let resets_at: String
+    let utilization: Double?
+    let resets_at: String?
 }
 
 struct UsageLimit: Codable {
@@ -37,6 +40,7 @@ struct UsageLimit: Codable {
     let kind: String?
     let percent: Double?
     let is_active: Bool?
+    let resets_at: String?
     /// Set on a "weekly_scoped" entry: the weekly cap that applies to one model only.
     /// This is where per-model limits are reported now; the seven_day_opus and
     /// seven_day_sonnet fields come back null.
@@ -55,8 +59,8 @@ struct ModelWindow {
 }
 
 struct UsageResponse: Codable {
-    let five_hour: UsageWindow
-    let seven_day: UsageWindow
+    let five_hour: UsageWindow?
+    let seven_day: UsageWindow?
     let seven_day_opus: UsageWindow?
     let seven_day_sonnet: UsageWindow?
     let limits: [UsageLimit]?
@@ -193,13 +197,39 @@ func modelWindows(_ usage: UsageResponse) -> [ModelWindow] {
     return out.sorted { $0.label < $1.label }
 }
 
+/// One window as the menu needs it, taken from whichever shape carried it this time.
+///
+/// The API reports each reading twice: as a dedicated `five_hour` / `seven_day` object and
+/// as an entry in `limits` with the same percentage and reset time. It has already retired
+/// one of those shapes once — the per-model caps went null in their own fields and turned up
+/// under `limits` — so neither is treated as the one that must be there. A row is only lost
+/// when both come back empty.
+func windowReading(_ dedicated: UsageWindow?, _ limits: [UsageLimit]?,
+                   kind: String) -> (pct: Double, resetsAt: Date)? {
+    let entry = limits?.first { $0.kind == kind }
+    guard let pct = dedicated?.utilization ?? entry?.percent,
+          let stamp = dedicated?.resets_at ?? entry?.resets_at,
+          let resetsAt = parseISO(stamp)
+    else { return nil }
+    return (pct, resetsAt)
+}
+
 func decodeUsage(_ result: Result<Data, Error>) -> Result<UsageResponse, Error> {
     result.flatMap { data in
         guard let usage = try? JSONDecoder().decode(UsageResponse.self, from: data) else {
+            recordUnexpected(data)
             return .failure(ClaudeError.shape)
         }
         return .success(usage)
     }
+}
+
+/// Writes aside a response the app could not read. "The private API may have changed" is
+/// a guess without the payload that caused it; this leaves the payload next to the config,
+/// overwritten each time. It carries usage numbers and no credentials.
+func recordUnexpected(_ data: Data) {
+    try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+    try? data.write(to: configDir.appendingPathComponent("last-unexpected-response.json"))
 }
 
 func fetchUsage(_ account: Account, completion: @escaping (Result<UsageResponse, Error>) -> Void) {
@@ -544,37 +574,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         polled = true
         switch result {
         case .failure(let err):
-            var r = readings[name] ?? Reading(fiveHourPct: 0, sevenDayPct: 0,
-                                              fiveHourResetsAt: .distantFuture,
-                                              sevenDayResetsAt: .distantFuture,
-                                              models: [], active: false, error: nil, lastSeen: nil)
-            r.error = err.localizedDescription
-            readings[name] = r
+            note(error: err.localizedDescription, for: name)
 
         case .success(let usage):
-            guard let fiveReset = parseISO(usage.five_hour.resets_at),
-                  let sevenReset = parseISO(usage.seven_day.resets_at) else {
-                readings[name]?.error = ClaudeError.shape.localizedDescription
+            guard let five = windowReading(usage.five_hour, usage.limits, kind: "session"),
+                  let seven = windowReading(usage.seven_day, usage.limits, kind: "weekly_all")
+            else {
+                note(error: ClaudeError.shape.localizedDescription, for: name)
                 break
             }
             let session = usage.limits?.first { $0.group == "session" || $0.kind == "session" }
             readings[name] = Reading(
-                fiveHourPct: usage.five_hour.utilization,
-                sevenDayPct: usage.seven_day.utilization,
-                fiveHourResetsAt: fiveReset,
-                sevenDayResetsAt: sevenReset,
+                fiveHourPct: five.pct,
+                sevenDayPct: seven.pct,
+                fiveHourResetsAt: five.resetsAt,
+                sevenDayResetsAt: seven.resetsAt,
                 models: modelWindows(usage),
                 active: session?.is_active ?? false,
                 error: nil,
                 lastSeen: nil)
 
             check(name: name, window: "five_hour", label: T.fiveHourWindow,
-                  resetsAt: fiveReset, utilization: usage.five_hour.utilization)
+                  resetsAt: five.resetsAt, utilization: five.pct)
             check(name: name, window: "seven_day", label: T.sevenDayWindow,
-                  resetsAt: sevenReset, utilization: usage.seven_day.utilization)
+                  resetsAt: seven.resetsAt, utilization: seven.pct)
         }
         updateTitle()
         rebuildMenu()
+    }
+
+    /// Marks the row as failed while keeping whatever it already showed, so a hiccup turns
+    /// a live account into a labelled error rather than into nothing at all.
+    private func note(error: String, for name: String) {
+        var r = readings[name] ?? Reading(fiveHourPct: 0, sevenDayPct: 0,
+                                          fiveHourResetsAt: .distantFuture,
+                                          sevenDayResetsAt: .distantFuture,
+                                          models: [], active: false, error: nil, lastSeen: nil)
+        r.error = error
+        readings[name] = r
     }
 
     private func check(name: String, window: String, label: String, resetsAt: Date, utilization: Double) {
@@ -865,6 +902,34 @@ func runSelfCheck() {
     """
     let plain = try! JSONDecoder().decode(UsageResponse.self, from: plainJSON.data(using: .utf8)!)
     assert(modelWindows(plain).isEmpty, "no scoped caps, no model rows")
+
+    // A window whose dedicated field went null is read from limits[] instead — the same
+    // move the per-model caps already made, and the shape that left the app showing
+    // "unexpected shape" while Claude Code itself was fine.
+    let nulledJSON = """
+    {"five_hour":null,
+     "seven_day":{"utilization":null,"resets_at":null},
+     "limits":[{"kind":"session","group":"session","percent":9,"is_active":true,
+                "resets_at":"2026-08-17T14:29:59Z"},
+               {"kind":"weekly_all","group":"weekly","percent":25,
+                "resets_at":"2026-08-22T22:59:59Z"}]}
+    """
+    let nulled = try! JSONDecoder().decode(UsageResponse.self, from: nulledJSON.data(using: .utf8)!)
+    let fromLimits = windowReading(nulled.five_hour, nulled.limits, kind: "session")
+    assert(fromLimits?.pct == 9, "a null five_hour falls back to the session entry")
+    assert(windowReading(nulled.seven_day, nulled.limits, kind: "weekly_all")?.pct == 25,
+           "null fields inside a window fall back the same way")
+    assert(fromLimits?.resetsAt == parseISO("2026-08-17T14:29:59Z"),
+           "the reset time comes along with the percentage")
+
+    // The dedicated field still wins while the API reports it.
+    assert(windowReading(scoped.five_hour, scoped.limits, kind: "session")?.pct == 9)
+
+    // Nothing to read anywhere is still an error rather than a row of zeros.
+    let emptyJSON = #"{"five_hour":null,"seven_day":null,"limits":[]}"#
+    let empty = try! JSONDecoder().decode(UsageResponse.self, from: emptyJSON.data(using: .utf8)!)
+    assert(windowReading(empty.five_hour, empty.limits, kind: "session") == nil,
+           "an empty response reports failure, it does not invent a reading")
 
     // The gauge must always occupy the same width, or the rows stop lining up.
     for v in [-5.0, 0, 0.4, 12.5, 50, 99.9, 100, 150] {

@@ -34,16 +34,20 @@ import (
 
 // ─── Model ────────────────────────────────────────────────────────────────────
 
+// Every field is a pointer. The API has already moved one reading out of its dedicated
+// field once (the per-model caps), and a null arriving where a number used to be must be
+// told apart from a real zero so the other shape can be read instead.
 type UsageWindow struct {
-	Utilization float64 `json:"utilization"`
-	ResetsAt    string  `json:"resets_at"`
+	Utilization *float64 `json:"utilization"`
+	ResetsAt    *string  `json:"resets_at"`
 }
 
 type UsageLimit struct {
-	Kind     string  `json:"kind"`
-	Group    string  `json:"group"`
-	Percent  float64 `json:"percent"`
-	IsActive bool    `json:"is_active"`
+	Kind     string   `json:"kind"`
+	Group    string   `json:"group"`
+	Percent  *float64 `json:"percent"`
+	IsActive bool     `json:"is_active"`
+	ResetsAt *string  `json:"resets_at"`
 	// Set on a "weekly_scoped" entry: the weekly cap that applies to one model only.
 	// This is where per-model limits are reported now; the seven_day_opus and
 	// seven_day_sonnet fields come back null.
@@ -61,8 +65,8 @@ type modelWindow struct {
 }
 
 type UsageResponse struct {
-	FiveHour       UsageWindow  `json:"five_hour"`
-	SevenDay       UsageWindow  `json:"seven_day"`
+	FiveHour       *UsageWindow `json:"five_hour"`
+	SevenDay       *UsageWindow `json:"seven_day"`
 	SevenDayOpus   *UsageWindow `json:"seven_day_opus"`
 	SevenDaySonnet *UsageWindow `json:"seven_day_sonnet"`
 	Limits         []UsageLimit `json:"limits"`
@@ -618,19 +622,53 @@ func parseISO(s string) (time.Time, bool) {
 	return t, err == nil
 }
 
+// windowReading returns one window as the menu needs it, taken from whichever shape
+// carried it this time. The API reports each reading twice: as a dedicated five_hour /
+// seven_day object and as an entry in limits[] with the same percentage and reset time. It
+// has already retired one of those shapes once — the per-model caps went null in their own
+// fields and turned up under limits[] — so neither is treated as the one that must be
+// there. A window is only lost when both come back empty.
+func windowReading(w *UsageWindow, limits []UsageLimit, kind string) (float64, time.Time, bool) {
+	var pct *float64
+	var stamp *string
+	if w != nil {
+		pct, stamp = w.Utilization, w.ResetsAt
+	}
+	for i := range limits {
+		if limits[i].Kind != kind {
+			continue
+		}
+		if pct == nil {
+			pct = limits[i].Percent
+		}
+		if stamp == nil {
+			stamp = limits[i].ResetsAt
+		}
+		break
+	}
+	if pct == nil || stamp == nil {
+		return 0, time.Time{}, false
+	}
+	t, ok := parseISO(*stamp)
+	if !ok {
+		return 0, time.Time{}, false
+	}
+	return *pct, t, true
+}
+
 func toReading(name string, u UsageResponse, err error) reading {
 	if err != nil {
 		return reading{name: name, err: err.Error()}
 	}
-	five, ok1 := parseISO(u.FiveHour.ResetsAt)
-	seven, ok2 := parseISO(u.SevenDay.ResetsAt)
+	fivePct, five, ok1 := windowReading(u.FiveHour, u.Limits, "session")
+	sevenPct, seven, ok2 := windowReading(u.SevenDay, u.Limits, "weekly_all")
 	if !ok1 || !ok2 {
 		return reading{name: name, err: T().badTimestamp}
 	}
 	r := reading{
 		name:             name,
-		fiveHourPct:      u.FiveHour.Utilization,
-		sevenDayPct:      u.SevenDay.Utilization,
+		fiveHourPct:      fivePct,
+		sevenDayPct:      sevenPct,
 		fiveHourResetsAt: five,
 		sevenDayResetsAt: seven,
 	}
@@ -645,18 +683,18 @@ func toReading(name string, u UsageResponse, err error) reading {
 		seen[label] = true
 		r.models = append(r.models, modelWindow{label: label, pct: percent})
 	}
-	if u.SevenDayOpus != nil {
-		addModel("Opus", u.SevenDayOpus.Utilization)
+	if u.SevenDayOpus != nil && u.SevenDayOpus.Utilization != nil {
+		addModel("Opus", *u.SevenDayOpus.Utilization)
 	}
-	if u.SevenDaySonnet != nil {
-		addModel("Sonnet", u.SevenDaySonnet.Utilization)
+	if u.SevenDaySonnet != nil && u.SevenDaySonnet.Utilization != nil {
+		addModel("Sonnet", *u.SevenDaySonnet.Utilization)
 	}
 	for _, l := range u.Limits {
 		if l.Group == "session" || l.Kind == "session" {
 			r.active = l.IsActive
 		}
-		if l.Group == "weekly" && l.Scope != nil && l.Scope.Model != nil {
-			addModel(l.Scope.Model.DisplayName, l.Percent)
+		if l.Group == "weekly" && l.Scope != nil && l.Scope.Model != nil && l.Percent != nil {
+			addModel(l.Scope.Model.DisplayName, *l.Percent)
 		}
 	}
 	sort.Slice(r.models, func(i, j int) bool { return r.models[i].label < r.models[j].label })
@@ -993,9 +1031,17 @@ func assert(cond bool, what string) {
 	}
 }
 
+// ptr takes the address of a literal, which the optional payload fields need.
+func ptr[T any](v T) *T { return &v }
+
+// win builds a dedicated usage window, for the self-check.
+func win(pct float64, resetsAt string) *UsageWindow {
+	return &UsageWindow{Utilization: ptr(pct), ResetsAt: ptr(resetsAt)}
+}
+
 // mustScoped builds a weekly limit scoped to one model, for the self-check.
 func mustScoped(model string, percent float64) UsageLimit {
-	l := UsageLimit{Kind: "weekly_scoped", Group: "weekly", Percent: percent}
+	l := UsageLimit{Kind: "weekly_scoped", Group: "weekly", Percent: ptr(percent)}
 	l.Scope = new(struct {
 		Model *struct {
 			DisplayName string `json:"display_name"`
@@ -1127,11 +1173,11 @@ func runSelfCheck() {
 	// Per-model weekly caps: read from the scoped entries in limits[], which is where the
 	// API reports them now that seven_day_opus and seven_day_sonnet come back null.
 	scoped := UsageResponse{
-		FiveHour: UsageWindow{Utilization: 9, ResetsAt: "2026-08-17T14:29:59Z"},
-		SevenDay: UsageWindow{Utilization: 25, ResetsAt: "2026-08-22T22:59:59Z"},
+		FiveHour: win(9, "2026-08-17T14:29:59Z"),
+		SevenDay: win(25, "2026-08-22T22:59:59Z"),
 		Limits: []UsageLimit{
-			{Kind: "session", Group: "session", Percent: 9, IsActive: true},
-			{Kind: "weekly_all", Group: "weekly", Percent: 25},
+			{Kind: "session", Group: "session", Percent: ptr(9.0), IsActive: true},
+			{Kind: "weekly_all", Group: "weekly", Percent: ptr(25.0)},
 		},
 	}
 	scoped.Limits = append(scoped.Limits, mustScoped("Fable", 3), mustScoped("Opus", 40))
@@ -1145,8 +1191,7 @@ func runSelfCheck() {
 
 	// The legacy fields still work, and must not duplicate a scoped entry of the same name.
 	legacy := scoped
-	opus := UsageWindow{Utilization: 77}
-	legacy.SevenDayOpus = &opus
+	legacy.SevenDayOpus = win(77, "")
 	dedup := toReading("acc", legacy, nil)
 	assert(len(dedup.models) == 2, "a model reported twice yields one row")
 	assert(dedup.models[1].label == "Opus" && dedup.models[1].pct == 77,
@@ -1158,6 +1203,28 @@ func runSelfCheck() {
 		Limits: []UsageLimit{{Kind: "session", Group: "session"}},
 	}, nil)
 	assert(len(plain.models) == 0, "no scoped caps, no model rows")
+
+	// A window whose dedicated field went null is read from limits[] instead — the same
+	// move the per-model caps already made, and the shape that left the app reporting an
+	// unexpected response while Claude Code itself was fine.
+	nulled := toReading("acc", UsageResponse{
+		FiveHour: nil,
+		SevenDay: &UsageWindow{},
+		Limits: []UsageLimit{
+			{Kind: "session", Group: "session", Percent: ptr(9.0), IsActive: true,
+				ResetsAt: ptr("2026-08-17T14:29:59Z")},
+			{Kind: "weekly_all", Group: "weekly", Percent: ptr(25.0),
+				ResetsAt: ptr("2026-08-22T22:59:59Z")},
+		},
+	}, nil)
+	assert(nulled.err == "", "null windows fall back to limits[] rather than failing")
+	assert(nulled.fiveHourPct == 9 && nulled.sevenDayPct == 25,
+		"the percentages come from the limits entries")
+	assert(!nulled.fiveHourResetsAt.IsZero(), "the reset time comes along with the percentage")
+
+	// Nothing to read anywhere is still an error rather than a row of zeros.
+	assert(toReading("acc", UsageResponse{}, nil).err != "",
+		"an empty response reports failure, it does not invent a reading")
 
 	// The gauge must always occupy the same width, or the rows stop lining up.
 	for _, v := range []float64{-5, 0, 0.4, 12.5, 50, 99.9, 100, 150} {
