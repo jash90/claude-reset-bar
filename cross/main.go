@@ -72,17 +72,31 @@ type UsageResponse struct {
 	Limits         []UsageLimit `json:"limits"`
 }
 
+// Account is an extra account read with a claude.ai sessionKey — the shape the
+// claude-reset CLI reads too. OrgID may be left empty: it is discovered from the session
+// key on the next poll and written back.
 type Account struct {
 	Name       string `json:"name"`
 	SessionKey string `json:"session_key"`
 	OrgID      string `json:"org_id"`
+	// Keychain is set by the macOS app once it moved the key into the login Keychain.
+	Keychain bool `json:"keychain,omitempty"`
+}
+
+// OAuthAccount is an extra account read with an OAuth token, such as one from
+// `claude setup-token`. Kept apart from accounts, whose shape the claude-reset CLI relies on.
+type OAuthAccount struct {
+	Name     string `json:"name"`
+	Token    string `json:"token"`
+	Keychain bool   `json:"keychain,omitempty"`
 }
 
 type Config struct {
-	Accounts             []Account `json:"accounts"`
-	CheckIntervalMinutes int       `json:"check_interval_minutes,omitempty"`
-	SlackWebhookURL      string    `json:"slack_webhook_url,omitempty"`
-	Language             string    `json:"language,omitempty"`
+	Accounts             []Account      `json:"accounts"`
+	OAuthAccounts        []OAuthAccount `json:"oauth_accounts,omitempty"`
+	CheckIntervalMinutes int            `json:"check_interval_minutes,omitempty"`
+	SlackWebhookURL      string         `json:"slack_webhook_url,omitempty"`
+	Language             string         `json:"language,omitempty"`
 }
 
 // window is one limit window: how much of it is used and when it starts over.
@@ -213,47 +227,100 @@ func homeFile(parts ...string) string {
 	return filepath.Join(append([]string{home}, parts...)...)
 }
 
-func tokenFromJSON(raw []byte) string {
-	var doc struct {
-		ClaudeAiOauth struct {
-			AccessToken string `json:"accessToken"`
-		} `json:"claudeAiOauth"`
-	}
-	if json.Unmarshal(raw, &doc) != nil {
-		return ""
-	}
-	return doc.ClaudeAiOauth.AccessToken
+// storedCredential is one login Claude Code stored: the access token and when it stops
+// working (Unix ms, 0 when the item does not say).
+type storedCredential struct {
+	token     string
+	expiresAt float64
 }
 
-// oauthToken returns the subscription token Claude Code stored. On Windows and Linux it
-// lives in ~/.claude/.credentials.json; on macOS Claude Code keeps it in the Keychain, so
-// the file is only the first place we look.
+func parseCredential(raw []byte) (storedCredential, bool) {
+	var doc struct {
+		ClaudeAiOauth struct {
+			AccessToken string  `json:"accessToken"`
+			ExpiresAt   float64 `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(raw, &doc) != nil || doc.ClaudeAiOauth.AccessToken == "" {
+		return storedCredential{}, false
+	}
+	return storedCredential{doc.ClaudeAiOauth.AccessToken, doc.ClaudeAiOauth.ExpiresAt}, true
+}
+
+// liveTokens returns the tokens worth polling, freshest first, each once. An expired token
+// is dropped: it belongs to a profile nobody has used lately, and only Claude Code may
+// refresh it. When every token has expired the freshest one is still returned, so the row
+// says "run Claude Code" instead of the account silently disappearing.
+func liveTokens(creds []storedCredential, now time.Time) []string {
+	nowMs := float64(now.UnixMilli())
+	sorted := append([]storedCredential(nil), creds...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].expiresAt > sorted[j].expiresAt })
+	var live []storedCredential
+	for _, c := range sorted {
+		if c.expiresAt == 0 || c.expiresAt > nowMs {
+			live = append(live, c)
+		}
+	}
+	if len(live) == 0 && len(sorted) > 0 {
+		live = sorted[:1]
+	}
+	var out []string
+	for _, c := range live {
+		if !slices.Contains(out, c.token) {
+			out = append(out, c.token)
+		}
+	}
+	return out
+}
+
+// credentialFiles lists the files Claude Code may have written: the default profile, the
+// one CLAUDE_CONFIG_DIR points at, and the common habit of keeping extra profiles in
+// ~/.claude-<name>.
+func credentialFiles() []string {
+	dirs := []string{homeFile(".claude")}
+	if custom := os.Getenv("CLAUDE_CONFIG_DIR"); custom != "" {
+		dirs = append(dirs, custom)
+	}
+	if matches, err := filepath.Glob(homeFile(".claude-*")); err == nil {
+		sort.Strings(matches)
+		dirs = append(dirs, matches...)
+	}
+	files := make([]string, len(dirs))
+	for i, d := range dirs {
+		files[i] = filepath.Join(d, ".credentials.json")
+	}
+	return files
+}
+
+// claudeCodeTokens returns every Claude Code login on this machine that can be polled. On
+// Windows and Linux they live in credential files; on macOS Claude Code keeps them in the
+// Keychain, one item per profile, so every item is read — an MCP OAuth flow also writes one
+// under the same service name holding no subscription token at all.
 //
 // We deliberately do NOT use the refresh token — refreshing it ourselves would invalidate
-// Claude Code's own session. The token is re-read on every poll, so a refresh performed by
+// Claude Code's own session. Tokens are re-read on every poll, so a refresh performed by
 // Claude Code is picked up immediately.
-func oauthToken() string {
-	if raw, err := os.ReadFile(homeFile(".claude", ".credentials.json")); err == nil {
-		if tok := tokenFromJSON(raw); tok != "" {
-			return tok
+func claudeCodeTokens() []string {
+	var creds []storedCredential
+	for _, f := range credentialFiles() {
+		if raw, err := os.ReadFile(f); err == nil {
+			if c, ok := parseCredential(raw); ok {
+				creds = append(creds, c)
+			}
 		}
 	}
 	if runtime.GOOS == "darwin" {
-		return keychainToken()
+		creds = append(creds, keychainCredentials()...)
 	}
-	return ""
+	return liveTokens(creds, time.Now())
 }
 
-// keychainToken reads the token out of every Keychain item that could carry one. Several
-// items share the service name "Claude Code-credentials": Claude Code writes one per
-// profile (plus "-<hash>" variants), and an MCP OAuth flow writes its own under account
-// "unknown" holding no subscription token at all. Asking for a service alone returns
-// whichever item comes first, so we read them all and keep the first real token.
-func keychainToken() string {
+func keychainCredentials() []storedCredential {
 	username := ""
 	if u, err := osuser.Current(); err == nil {
 		username = u.Username
 	}
+	var creds []storedCredential
 	for _, service := range keychainCredentialServices() {
 		for _, account := range []string{username, ""} {
 			args := []string{"find-generic-password", "-s", service}
@@ -264,13 +331,49 @@ func keychainToken() string {
 			if err != nil {
 				continue
 			}
-			if tok := tokenFromJSON(bytes.TrimSpace(out)); tok != "" {
-				return tok
+			if c, ok := parseCredential(bytes.TrimSpace(out)); ok {
+				creds = append(creds, c)
 			}
 		}
 	}
-	return ""
+	return creds
 }
+
+// login is one Claude Code login and the name its row is shown under.
+type login struct{ name, token string }
+
+// nameClaudeCodeLogins names the logins found this poll. A login whose email could not be
+// fetched keeps the name it had before; failing that it gets a numbered "Claude Code" name.
+// A name the config already uses is skipped — that account is on screen already — and so is
+// a second login into the same account.
+func nameClaudeCodeLogins(tokens, emails []string, known map[string]string,
+	previous []string, configured map[string]bool) []login {
+	var out []login
+	for i, token := range tokens {
+		name := emails[i]
+		if name == "" {
+			name = known[token]
+		}
+		if name == "" {
+			switch {
+			case len(tokens) == 1 && len(previous) == 1:
+				name = previous[0]
+			case i == 0:
+				name = "Claude Code"
+			default:
+				name = fmt.Sprintf("Claude Code %d", i+1)
+			}
+		}
+		if configured[name] || slices.ContainsFunc(out, func(l login) bool { return l.name == name }) {
+			continue
+		}
+		out = append(out, login{name, token})
+	}
+	return out
+}
+
+// isOAuthToken tells a token Claude Code issues from a claude.ai sessionKey.
+func isOAuthToken(key string) bool { return strings.HasPrefix(key, "sk-ant-oat") }
 
 // keychainCredentialServices lists the "Claude Code-credentials" services present. The dump
 // reads attributes only, never a secret, so it prompts for nothing.
@@ -376,6 +479,26 @@ func fetchUsageSession(a Account) (UsageResponse, error) {
 	return u, doJSON(req, &u)
 }
 
+// discoverOrgID finds the account's organization UUID with nothing but the session key.
+// Every claude.ai account belongs to exactly one, and it appears nowhere in the UI.
+func discoverOrgID(sessionKey string) (string, error) {
+	req, _ := http.NewRequest("GET", "https://claude.ai/api/organizations", nil)
+	for k, v := range browserHeaders {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Cookie", "sessionKey="+sessionKey)
+	var orgs []struct {
+		UUID string `json:"uuid"`
+	}
+	if err := doJSON(req, &orgs); err != nil {
+		return "", err
+	}
+	if len(orgs) == 0 || orgs[0].UUID == "" {
+		return "", fmt.Errorf(T().badShape, "no organization")
+	}
+	return orgs[0].UUID, nil
+}
+
 // ─── Config (shared with claude-reset and the Swift build) ────────────────────
 
 func configPath() string { return homeFile(".config", "claude-reset", "config.json") }
@@ -396,11 +519,62 @@ func ensureConfig() error {
 	if err := os.MkdirAll(filepath.Dir(configPath()), 0o700); err != nil {
 		return err
 	}
+	// org_id is left out: it is discovered from the session key and written back.
 	skeleton := []byte("{\n  \"accounts\": [\n" +
-		"    { \"name\": \"\", \"session_key\": \"\", \"org_id\": \"\" }\n" +
+		"    { \"name\": \"\", \"session_key\": \"\" }\n" +
+		"  ],\n  \"oauth_accounts\": [\n" +
+		"    { \"name\": \"\", \"token\": \"\" }\n" +
 		"  ],\n  \"check_interval_minutes\": 15\n}\n")
 	// 0o600 — the file holds session keys, nobody but the owner reads it.
 	return os.WriteFile(configPath(), skeleton, 0o600)
+}
+
+// configuredNames lists every account the config names, in display order. An unfilled
+// skeleton entry is not an account.
+func (c Config) configuredNames() []string {
+	var names []string
+	for _, a := range c.Accounts {
+		if a.Name != "" && (a.SessionKey != "" || a.Keychain) {
+			names = append(names, a.Name)
+		}
+	}
+	for _, a := range c.OAuthAccounts {
+		if a.Name != "" && (a.Token != "" || a.Keychain) {
+			names = append(names, a.Name)
+		}
+	}
+	return names
+}
+
+// saveOrgID writes a discovered org_id into the named account's entry. It edits the file as
+// generic JSON so every key this build does not know about survives untouched.
+func saveOrgID(name, orgID string) error {
+	raw, err := os.ReadFile(configPath())
+	if err != nil {
+		return err
+	}
+	patched, err := patchOrgID(bytes.TrimPrefix(raw, []byte("\xef\xbb\xbf")), name, orgID)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath(), patched, 0o600)
+}
+
+func patchOrgID(raw []byte, name, orgID string) ([]byte, error) {
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	accounts, _ := doc["accounts"].([]any)
+	for _, entry := range accounts {
+		if a, ok := entry.(map[string]any); ok && a["name"] == name {
+			if id, _ := a["org_id"].(string); id == "" {
+				a["org_id"] = orgID
+			}
+		}
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	return append(out, '\n'), err
 }
 
 func openInEditor(path string) {
@@ -618,7 +792,11 @@ var (
 	readings   []reading
 	baselines  = map[string]map[string]windowState{}
 	fastPolled = map[string]time.Time{}
-	oauthLabel = ""
+	// claudeCodeNames are the names of the Claude Code logins seen on the last poll, and
+	// tokenNames the name each token was last shown under, for a poll where its email
+	// cannot be fetched.
+	claudeCodeNames []string
+	tokenNames      = map[string]string{}
 	// Accounts that dropped out of reach, keyed by name, keeping their last reading so the
 	// row does not simply vanish. Memory only — a restart forgets them.
 	staleAccounts = map[string]reading{}
@@ -734,28 +912,21 @@ func checkReset(name, window, label string, resetsAt time.Time, utilization floa
 	baselines[name][window] = next
 }
 
-// switchOAuthAccount reacts to the account signed into Claude Code being swapped. The old
-// baseline describes a different account's limit window, so it is dropped — the new account
-// starts from its own first reading and never gets a bogus reset notification.
-func switchOAuthAccount(label string) {
-	mu.Lock()
-	defer mu.Unlock()
-	if label == oauthLabel {
-		return
-	}
-	if oauthLabel != "" {
-		// Keep the final reading around. resets_at does not move until the window actually
-		// resets, so the countdown stays truthful even though nothing refreshes it.
+// retire handles Claude Code logins that are gone — signed out, or swapped by /login. Their
+// old baseline describes a limit window we can no longer follow, so it is dropped, and the
+// final reading is kept as a snapshot: resets_at does not move until the window actually
+// resets, so its countdown stays truthful even though nothing refreshes it. Call with mu held.
+func retire(names []string) {
+	for _, name := range names {
 		for _, r := range readings {
-			if r.name == oauthLabel && r.err == "" {
+			if r.name == name && r.err == "" && r.lastSeen.IsZero() {
 				r.lastSeen = time.Now()
-				staleAccounts[oauthLabel] = r
+				staleAccounts[name] = r
 			}
 		}
-		delete(baselines, oauthLabel)
-		delete(fastPolled, oauthLabel)
+		delete(baselines, name)
+		delete(fastPolled, name)
 	}
-	oauthLabel = label
 }
 
 // mergeStale appends snapshots of unreachable accounts after the live rows, skipping any
@@ -781,31 +952,76 @@ func mergeStale(live []reading, stale map[string]reading) []reading {
 
 func poll() {
 	cfg := loadConfig()
-	var out []reading
-
-	// The account signed into Claude Code — no configuration needed.
-	if token := oauthToken(); token != "" {
-		// The label is fetched on every poll because /login in Claude Code swaps the
-		// account behind the same Keychain entry. The name keys our state, so without
-		// this a new account would be compared against the previous one's baseline.
-		label := fetchOAuthLabel(token)
-		if label == "" && oauthLabel == "" {
-			label = "Claude Code" // profile unavailable on the very first reading
-		}
-		if label != "" {
-			switchOAuthAccount(label)
-		}
-		u, err := fetchUsageOAuth(token)
-		out = append(out, toReading(oauthLabel, u, err))
+	configured := map[string]bool{}
+	for _, name := range cfg.configuredNames() {
+		configured[name] = true
 	}
 
-	// Extra accounts from the config (sessionKey). Isolated: an expired key on one must
-	// not block the others.
+	// Every Claude Code login — no configuration needed. The email is fetched on every
+	// poll because /login swaps the account behind the same credentials, and the name keys
+	// our state: without it a new account would be compared against the previous baseline.
+	tokens := claudeCodeTokens()
+	emails := make([]string, len(tokens))
+	for i, token := range tokens {
+		emails[i] = fetchOAuthLabel(token)
+	}
+	mu.Lock()
+	logins := nameClaudeCodeLogins(tokens, emails, tokenNames, claudeCodeNames, configured)
+	tokenNames = map[string]string{}
+	var current []string
+	for _, l := range logins {
+		tokenNames[l.token] = l.name
+		current = append(current, l.name)
+	}
+	var gone []string
+	for _, name := range claudeCodeNames {
+		if !slices.Contains(current, name) {
+			gone = append(gone, name)
+		}
+	}
+	retire(gone)
+	claudeCodeNames = current
+	mu.Unlock()
+
+	var out []reading
+	for _, l := range logins {
+		u, err := fetchUsageOAuth(l.token)
+		out = append(out, toReading(l.name, u, err))
+	}
+
+	// Extra accounts from the config. Isolated: an expired key on one must not block the
+	// others.
+	// The macOS app keeps added keys in its own Keychain items, which only it can read
+	// without a password prompt on every poll — so such an account says where its key is.
 	for _, a := range cfg.Accounts {
-		if a.Name == "" || a.SessionKey == "" || a.OrgID == "" {
+		if a.Keychain && a.Name != "" {
+			out = append(out, reading{name: a.Name, err: T().keychainOnly})
+			continue
+		}
+		if a.Name == "" || a.SessionKey == "" {
 			continue // skeleton written by ensureConfig, not filled in yet
 		}
+		if a.OrgID == "" {
+			id, err := discoverOrgID(a.SessionKey)
+			if err != nil {
+				out = append(out, reading{name: a.Name, err: err.Error()})
+				continue
+			}
+			a.OrgID = id
+			saveOrgID(a.Name, id)
+		}
 		u, err := fetchUsageSession(a)
+		out = append(out, toReading(a.Name, u, err))
+	}
+	for _, a := range cfg.OAuthAccounts {
+		if a.Keychain && a.Name != "" {
+			out = append(out, reading{name: a.Name, err: T().keychainOnly})
+			continue
+		}
+		if a.Name == "" || a.Token == "" {
+			continue
+		}
+		u, err := fetchUsageOAuth(a.Token)
 		out = append(out, toReading(a.Name, u, err))
 	}
 
@@ -1192,9 +1408,11 @@ func runSelfCheck() {
 	assert(parsed.Language == "pl", "the language setting is read")
 
 	// The token is found in the credentials layout, and absent when the section is missing.
-	assert(tokenFromJSON([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x"}}`)) == "sk-ant-oat01-x",
+	cred, credOK := parseCredential([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","expiresAt":1793743818844}}`))
+	assert(credOK && cred.token == "sk-ant-oat01-x" && cred.expiresAt == 1793743818844,
 		"the token is read from JSON")
-	assert(tokenFromJSON([]byte(`{"mcpOAuth":{}}`)) == "", "no token when the section is missing")
+	_, credOK = parseCredential([]byte(`{"mcpOAuth":{}}`))
+	assert(!credOK, "no token when the section is missing")
 
 	// Per-model weekly caps: read from the scoped entries in limits[], which is where the
 	// API reports them now that seven_day_opus and seven_day_sonnet come back null.
@@ -1273,6 +1491,51 @@ func runSelfCheck() {
 	// Nothing to read anywhere is still an error rather than a row of zeros.
 	assert(toReading("acc", UsageResponse{}, nil).err != "",
 		"an empty response reports failure, it does not invent a reading")
+
+	// Several Claude Code logins: expired ones are dropped, the rest come freshest first,
+	// and a token stored twice (Keychain and file) is polled once.
+	now = time.Now()
+	nowMs := float64(now.UnixMilli())
+	live := liveTokens([]storedCredential{
+		{"old", nowMs - 1000}, {"b", nowMs + 1000}, {"a", nowMs + 9000}, {"b", nowMs + 1000},
+	}, now)
+	assert(slices.Equal(live, []string{"a", "b"}), "live tokens, freshest first, each once")
+	assert(slices.Equal(liveTokens([]storedCredential{{"x", 0}}, now), []string{"x"}),
+		"a token without an expiry is kept")
+	assert(slices.Equal(liveTokens([]storedCredential{{"old", nowMs - 1000}, {"older", nowMs - 9000}}, now),
+		[]string{"old"}), "with every token expired the freshest stays, so the row can say why")
+	assert(len(liveTokens(nil, now)) == 0, "no credentials, no tokens")
+
+	named := nameClaudeCodeLogins([]string{"t1", "t2", "t3", "t4"}, []string{"a@x", "", "a@x", "cfg@x"},
+		map[string]string{"t2": "b@x"}, nil, map[string]bool{"cfg@x": true})
+	assert(len(named) == 2 && named[0].name == "a@x" && named[1].name == "b@x",
+		"emails name logins, a known token keeps its name, duplicates and configured names are skipped")
+	keptName := nameClaudeCodeLogins([]string{"new"}, []string{""}, nil, []string{"me@x"}, nil)
+	assert(keptName[0].name == "me@x", "a single login whose email is unavailable keeps the previous name")
+	unnamed := nameClaudeCodeLogins([]string{"t1", "t2"}, []string{"", ""}, nil, nil, nil)
+	assert(unnamed[0].name == "Claude Code" && unnamed[1].name == "Claude Code 2",
+		"unnamed logins get distinct names")
+
+	// Config accounts: both kinds are listed, an unfilled skeleton entry is not an account,
+	// and a discovered org_id is written back without disturbing anything else in the file.
+	var multiCfg Config
+	json.Unmarshal([]byte(`{"accounts":[{"name":"s","session_key":"k"},{"name":"","session_key":""}],`+
+		`"oauth_accounts":[{"name":"t","token":"sk-ant-oat1"}]}`), &multiCfg)
+	assert(slices.Equal(multiCfg.configuredNames(), []string{"s", "t"}), "both kinds of account, in order")
+	var kcCfg Config
+	json.Unmarshal([]byte(`{"accounts":[{"name":"s","session_key":"","keychain":true}],`+
+		`"oauth_accounts":[{"name":"t","token":"","keychain":true}]}`), &kcCfg)
+	assert(slices.Equal(kcCfg.configuredNames(), []string{"s", "t"}), "Keychain-backed entries count as accounts")
+	assert(isOAuthToken("sk-ant-oat01-abc") && !isOAuthToken("sk-ant-sid01-abc"), "token kinds")
+	patched, perr := patchOrgID([]byte(`{"accounts":[{"name":"s","session_key":"k"},`+
+		`{"name":"o","session_key":"k2","org_id":"keep"}],"slack_webhook_url":"https://x","extra":1}`), "s", "uuid-1")
+	var back map[string]any
+	json.Unmarshal(patched, &back)
+	accs, _ := back["accounts"].([]any)
+	assert(perr == nil && len(accs) == 2, "the account list survives the patch")
+	assert(accs[0].(map[string]any)["org_id"] == "uuid-1", "the discovered org_id is written")
+	assert(accs[1].(map[string]any)["org_id"] == "keep", "another account's org_id is untouched")
+	assert(back["slack_webhook_url"] == "https://x" && back["extra"] == 1.0, "unknown keys survive")
 
 	// The gauge must always occupy the same width, or the rows stop lining up.
 	for _, v := range []float64{-5, 0, 0.4, 12.5, 50, 99.9, 100, 150} {
