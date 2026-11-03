@@ -214,9 +214,14 @@ struct Reading {
     /// final reading.
     var lastSeen: Date?
 
-    /// The window that limits you right now: the 5-hour one while it runs, otherwise the
-    /// weekly one. This is what the menu bar figure shows.
-    var headline: Window? { fiveHour ?? sevenDay }
+    /// The window that limits you right now: the fuller of the two. A spent weekly limit
+    /// blocks the account however empty the 5-hour window is. This is what the menu bar
+    /// figure shows.
+    var headline: Window? {
+        guard let five = fiveHour else { return sevenDay }
+        guard let seven = sevenDay else { return five }
+        return seven.pct > five.pct ? seven : five
+    }
 }
 
 /// Turns a usage response into a reading. Each window is optional; the account only counts
@@ -548,6 +553,101 @@ func fetchUsageOAuth(token: String, completion: @escaping (Result<UsageResponse,
     fetchJSON(anthropicRequest(path: "/api/oauth/usage", token: token)) { completion(decodeUsage($0)) }
 }
 
+// MARK: - Limits from inference headers (tokens from `claude setup-token`)
+
+// A token from `claude setup-token` carries only the user:inference scope. The usage
+// endpoint answers it with 429 and a retry-after of about an hour, and the profile endpoint
+// with 403. Every inference response, though, reports the account's limits in its headers
+// (anthropic-ratelimit-unified-5h-utilization, -7d-utilization, -5h-reset, ...). So for such
+// a token the limits are read from a one-token request. It costs that account a few dozen
+// tokens per poll. count_tokens would be free, but it does not send these headers.
+
+/// The model of the one-token probe: the smallest current one.
+let probeModel = "claude-haiku-5-5"
+
+/// Turns the unified rate-limit headers into the same shape the usage endpoint returns.
+/// Utilization comes as a fraction (0.16) and the reset as Unix seconds. Keys must be
+/// lowercased. Returns nil when no window is reported at all.
+func usageFromHeaders(_ headers: [String: String]) -> UsageResponse? {
+    func window(_ tag: String) -> UsageWindow? {
+        guard let raw = headers["anthropic-ratelimit-unified-\(tag)-utilization"],
+              let fraction = Double(raw) else { return nil }
+        let reset = headers["anthropic-ratelimit-unified-\(tag)-reset"].flatMap(Double.init)
+            .map { ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: $0)) }
+        return UsageWindow(utilization: fraction * 100, resets_at: reset)
+    }
+    let five = window("5h"), seven = window("7d")
+    guard five != nil || seven != nil else { return nil }
+    return UsageResponse(five_hour: five, seven_day: seven, seven_day_opus: nil,
+                         seven_day_sonnet: nil, limits: nil)
+}
+
+func fetchUsageFromHeaders(token: String, completion: @escaping (Result<UsageResponse, Error>) -> Void) {
+    var req = anthropicRequest(path: "/v1/messages", token: token)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "content-type")
+    let body: [String: Any] = [
+        "model": probeModel,
+        "max_tokens": 1,
+        // OAuth tokens are only accepted for requests that present themselves as Claude Code.
+        "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "messages": [["role": "user", "content": "hi"]],
+    ]
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    URLSession.shared.dataTask(with: req) { data, resp, err in
+        if let err { return completion(.failure(err)) }
+        guard let http = resp as? HTTPURLResponse else { return completion(.failure(ClaudeError.shape)) }
+        let text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        if http.statusCode == 401 || http.statusCode == 403 { return completion(.failure(ClaudeError.auth(http.statusCode))) }
+        var headers: [String: String] = [:]
+        for (k, v) in http.allHeaderFields {
+            if let k = k as? String, let v = v as? String { headers[k.lowercased()] = v }
+        }
+        // A 429 from inference still carries the headers — and then they matter most.
+        if let usage = usageFromHeaders(headers) { return completion(.success(usage)) }
+        guard (200..<300).contains(http.statusCode) else {
+            return completion(.failure(ClaudeError.http(http.statusCode, text)))
+        }
+        completion(.failure(ClaudeError.shape))
+    }.resume()
+}
+
+/// Tokens the usage endpoint turned away, and until when to leave it alone for them.
+private let usageRefusals = UsageRefusals()
+
+final class UsageRefusals {
+    private var until: [String: Date] = [:]
+    private let lock = NSLock()
+
+    func isRefused(_ token: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return (until[token] ?? .distantPast) > Date()
+    }
+
+    func refuse(_ token: String, for seconds: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        until[token] = Date().addingTimeInterval(seconds)
+    }
+}
+
+/// Usage for a token added to the app: the usage endpoint while it answers, the inference
+/// headers when it refuses the token (403 for a missing scope, 429 for its hourly cap).
+func fetchUsageForToken(token: String, completion: @escaping (Result<UsageResponse, Error>) -> Void) {
+    guard !usageRefusals.isRefused(token) else { return fetchUsageFromHeaders(token: token, completion: completion) }
+    fetchUsageOAuth(token: token) { result in
+        switch result {
+        case .failure(ClaudeError.http(429, _)):
+            usageRefusals.refuse(token, for: 3600)
+            fetchUsageFromHeaders(token: token, completion: completion)
+        case .failure(ClaudeError.auth(403)):
+            usageRefusals.refuse(token, for: 86400)
+            fetchUsageFromHeaders(token: token, completion: completion)
+        default:
+            completion(result)
+        }
+    }
+}
+
 /// Names the Claude Code account by its email, so several accounts stay distinguishable.
 func fetchOAuthLabel(token: String, completion: @escaping (String?) -> Void) {
     fetchJSON(anthropicRequest(path: "/api/oauth/profile", token: token)) { result in
@@ -764,7 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 note(error: T.keyMissing, for: account.name)
                 continue
             }
-            fetchUsageOAuth(token: token) { [weak self] result in
+            fetchUsageForToken(token: token) { [weak self] result in
                 DispatchQueue.main.async { self?.apply(result, for: account.name) }
             }
         }
@@ -1103,7 +1203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        fetchUsageOAuth(token: key) { result in
+        fetchUsageForToken(token: key) { result in
             DispatchQueue.main.async {
                 switch result {
                 case .failure(let err):
@@ -1463,7 +1563,9 @@ func runSelfCheck() {
     assert(idleReading?.models.first?.label == "Fable", "per-model caps still come through")
     assert(windowLine(T.fiveHourLine, tag: "5h", nil).contains("5h"), "the idle line names its window")
     assert(makeReading(empty) == nil, "nothing readable anywhere still fails")
-    assert(makeReading(scoped)?.headline?.pct == 9, "a running 5-hour window drives the menu bar")
+    assert(makeReading(scoped)?.headline?.pct == 25, "the fuller window drives the menu bar")
+    let spent = Reading(fiveHour: (0, now), sevenDay: (100, now), active: false)
+    assert(spent.headline?.pct == 100, "a spent weekly limit is not hidden behind an empty 5-hour window")
 
     // Several Claude Code logins: expired ones are dropped, the rest come freshest first,
     // and a token stored twice (Keychain and file) is polled once.
@@ -1512,6 +1614,21 @@ func runSelfCheck() {
     assert(kcBack.accountList.first?.inKeychain == true && kcBack.oauthAccountList.first?.inKeychain == true,
            "the Keychain marker is written back")
     assert(keyAccount(.sessionKey, "a") != keyAccount(.token, "a"), "the two kinds never share an item")
+
+    // Limits read from inference headers — the route for setup-token tokens, which the usage
+    // endpoint refuses. Values are the ones a real response carried.
+    let fromHeaders = usageFromHeaders([
+        "anthropic-ratelimit-unified-7d-utilization": "0.16",
+        "anthropic-ratelimit-unified-7d-reset": "1794092400",
+        "anthropic-ratelimit-unified-status": "allowed",
+    ])
+    let headerReading = fromHeaders.flatMap(makeReading)
+    assert(headerReading?.sevenDay?.pct == 16, "the fraction becomes a percentage")
+    assert(headerReading?.sevenDay?.resetsAt == Date(timeIntervalSince1970: 1794092400), "the reset time is carried")
+    assert(headerReading?.fiveHour == nil, "no 5-hour header, no 5-hour window")
+    assert(usageFromHeaders(["anthropic-ratelimit-unified-5h-utilization": "0.5",
+                             "anthropic-ratelimit-unified-5h-reset": "1794000000"])?.five_hour?.utilization == 50)
+    assert(usageFromHeaders(["content-type": "application/json"]) == nil, "no limit headers, no reading")
 
     // Error bodies are shown on one line, preferring the API's own message.
     assert(apiErrorMessage(#"{"error":{"type":"x","message":"Rate limited. Please try again later."}}"#)

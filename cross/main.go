@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -124,13 +125,19 @@ type reading struct {
 	lastSeen time.Time
 }
 
-// headline is the window that limits you right now: the 5-hour one while it runs,
-// otherwise the weekly one. This is what the menu bar figure shows.
+// headline is the window that limits you right now: the fuller of the two. A spent weekly
+// limit blocks the account however empty the 5-hour window is. This is what the menu bar
+// figure shows.
 func (r reading) headline() *window {
-	if r.fiveHour != nil {
+	switch {
+	case r.fiveHour == nil:
+		return r.sevenDay
+	case r.sevenDay == nil:
 		return r.fiveHour
+	case r.sevenDay.pct > r.fiveHour.pct:
+		return r.sevenDay
 	}
-	return r.sevenDay
+	return r.fiveHour
 }
 
 // ─── Reset detection (pure logic, no I/O) ─────────────────────────────────────
@@ -415,16 +422,24 @@ func doJSON(req *http.Request, out any) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return fmt.Errorf(T().authRejected, resp.StatusCode)
-	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return statusError(resp.StatusCode)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf(T().badShape, err)
 	}
 	return nil
+}
+
+// statusError is an HTTP failure that keeps its code, so a caller can tell a refused token
+// (403) or a rate limit (429) from the rest.
+type statusError int
+
+func (e statusError) Error() string {
+	if e == 401 || e == 403 {
+		return fmt.Sprintf(T().authRejected, int(e))
+	}
+	return fmt.Sprintf("HTTP %d", int(e))
 }
 
 func anthropicReq(path, token string) *http.Request {
@@ -438,6 +453,88 @@ func anthropicReq(path, token string) *http.Request {
 func fetchUsageOAuth(token string) (UsageResponse, error) {
 	var u UsageResponse
 	return u, doJSON(anthropicReq("/api/oauth/usage", token), &u)
+}
+
+// A token from `claude setup-token` carries only the user:inference scope. The usage
+// endpoint answers it with 429 and a retry-after of about an hour, and the profile endpoint
+// with 403. Every inference response, though, reports the account's limits in its headers
+// (anthropic-ratelimit-unified-5h-utilization, -7d-utilization, -5h-reset, ...). So for such
+// a token the limits are read from a one-token request. It costs that account a few dozen
+// tokens per poll. count_tokens would be free, but it does not send these headers.
+
+// probeModel is the model of the one-token probe: the smallest current one.
+const probeModel = "claude-haiku-5-5"
+
+// usageFromHeaders turns the unified rate-limit headers into the shape the usage endpoint
+// returns. Utilization comes as a fraction (0.16), the reset as Unix seconds.
+func usageFromHeaders(h http.Header) (UsageResponse, bool) {
+	window := func(tag string) *UsageWindow {
+		raw := h.Get("anthropic-ratelimit-unified-" + tag + "-utilization")
+		var fraction float64
+		if _, err := fmt.Sscanf(raw, "%g", &fraction); raw == "" || err != nil {
+			return nil
+		}
+		w := &UsageWindow{Utilization: ptr(fraction * 100)}
+		var reset int64
+		if _, err := fmt.Sscanf(h.Get("anthropic-ratelimit-unified-"+tag+"-reset"), "%d", &reset); err == nil {
+			w.ResetsAt = ptr(time.Unix(reset, 0).UTC().Format(time.RFC3339))
+		}
+		return w
+	}
+	u := UsageResponse{FiveHour: window("5h"), SevenDay: window("7d")}
+	return u, u.FiveHour != nil || u.SevenDay != nil
+}
+
+func fetchUsageFromHeaders(token string) (UsageResponse, error) {
+	body := `{"model":"` + probeModel + `","max_tokens":1,` +
+		// OAuth tokens are only accepted for requests that present themselves as Claude Code.
+		`"system":"You are Claude Code, Anthropic's official CLI for Claude.",` +
+		`"messages":[{"role":"user","content":"hi"}]}`
+	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", strings.NewReader(body))
+	for k, v := range anthropicReq("", token).Header {
+		req.Header[k] = v
+	}
+	req.Header.Set("content-type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return UsageResponse{}, fmt.Errorf(T().networkError, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return UsageResponse{}, statusError(resp.StatusCode)
+	}
+	// A 429 from inference still carries the headers — and then they matter most.
+	if u, ok := usageFromHeaders(resp.Header); ok {
+		return u, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return UsageResponse{}, statusError(resp.StatusCode)
+	}
+	return UsageResponse{}, fmt.Errorf(T().badShape, "no limit headers")
+}
+
+// usageRefusedUntil remembers tokens the usage endpoint turned away, and until when to
+// leave it alone for them. Only touched from poll, which runs one at a time.
+var usageRefusedUntil = map[string]time.Time{}
+
+// fetchUsageForToken reads usage for a token added to the config: the usage endpoint while
+// it answers, the inference headers when it refuses the token (403 for a missing scope,
+// 429 for its hourly cap).
+func fetchUsageForToken(token string) (UsageResponse, error) {
+	if time.Now().Before(usageRefusedUntil[token]) {
+		return fetchUsageFromHeaders(token)
+	}
+	u, err := fetchUsageOAuth(token)
+	var se statusError
+	if errors.As(err, &se) && (se == 429 || se == 403) {
+		wait := time.Hour
+		if se == 403 {
+			wait = 24 * time.Hour
+		}
+		usageRefusedUntil[token] = time.Now().Add(wait)
+		return fetchUsageFromHeaders(token)
+	}
+	return u, err
 }
 
 // fetchOAuthLabel names the account by its email so several accounts stay distinguishable.
@@ -1024,7 +1121,7 @@ func poll() {
 		if a.Name == "" || a.Token == "" {
 			continue
 		}
-		u, err := fetchUsageOAuth(a.Token)
+		u, err := fetchUsageForToken(a.Token)
 		out = append(out, toReading(a.Name, u, err))
 	}
 
@@ -1539,6 +1636,24 @@ func runSelfCheck() {
 	assert(accs[0].(map[string]any)["org_id"] == "uuid-1", "the discovered org_id is written")
 	assert(accs[1].(map[string]any)["org_id"] == "keep", "another account's org_id is untouched")
 	assert(back["slack_webhook_url"] == "https://x" && back["extra"] == 1.0, "unknown keys survive")
+
+	// Limits read from inference headers — the route for setup-token tokens, which the usage
+	// endpoint refuses. Values are the ones a real response carried.
+	hdr := http.Header{}
+	hdr.Set("anthropic-ratelimit-unified-7d-utilization", "0.16")
+	hdr.Set("anthropic-ratelimit-unified-7d-reset", "1794092400")
+	hu, hok := usageFromHeaders(hdr)
+	hr := toReading("acc", hu, nil)
+	assert(hok && hr.err == "" && hr.sevenDay != nil && math.Abs(hr.sevenDay.pct-16) < 1e-9,
+		"the fraction becomes a percentage")
+	assert(hr.sevenDay.resetsAt.Equal(time.Unix(1794092400, 0)), "the reset time is carried")
+	assert(hr.fiveHour == nil, "no 5-hour header, no 5-hour window")
+	spent := reading{fiveHour: &window{pct: 0}, sevenDay: &window{pct: 100}}
+	assert(spent.headline().pct == 100, "a spent weekly limit is not hidden behind an empty 5-hour window")
+	_, hok = usageFromHeaders(http.Header{"Content-Type": {"application/json"}})
+	assert(!hok, "no limit headers, no reading")
+	assert(statusError(403).Error() == fmt.Sprintf(T().authRejected, 403) && statusError(429).Error() == "HTTP 429",
+		"status errors keep the messages they had")
 
 	// The gauge must always occupy the same width, or the rows stop lining up.
 	for _, v := range []float64{-5, 0, 0.4, 12.5, 50, 99.9, 100, 150} {

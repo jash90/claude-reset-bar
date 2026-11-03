@@ -76,7 +76,7 @@ The countdown on a snapshot row stays truthful, because `resets_at` does not mov
 
 **2. Add it with a `sessionKey`.** Find it in DevTools → *Application* → *Cookies* → `claude.ai` → `sessionKey`.
 
-**3. Add it with an OAuth token.** Run `claude setup-token` while signed into that account and paste the `sk-ant-oat…` token it prints. The token is checked against the usage endpoint before it is saved; if it is refused, use a `sessionKey` instead.
+**3. Add it with an OAuth token.** Run `claude setup-token` while signed into that account and paste the `sk-ant-oat…` token it prints. Such a token only carries the inference scope: the usage endpoint refuses it and the account's email cannot be read, so give it a name. The app then reads the limits from the headers of a one-token request to the smallest model instead — a few dozen tokens of that account per poll. The token is checked this way before it is saved.
 
 On macOS everything about accounts happens in one window, **Manage accounts…**, with no dialogs. **Add account…** in the menu opens the same window with the cursor in its form. The list shows every account: what kind it is, where its key is stored, and how its last poll went.
 
