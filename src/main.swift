@@ -142,12 +142,15 @@ struct Config: Codable {
     // whole file away over the missing key.
     var accounts: [Account]?
     var oauth_accounts: [OAuthAccount]?
+    /// Emails of Claude Code logins hidden from the menu. Hiding never touches the login.
+    var hidden_logins: [String]?
     var check_interval_minutes: Int?
     var slack_webhook_url: String?   // unused here, kept for claude-reset compatibility
     var language: String?
 
     var accountList: [Account] { accounts ?? [] }
     var oauthAccountList: [OAuthAccount] { oauth_accounts ?? [] }
+    var hiddenLogins: [String] { hidden_logins ?? [] }
     /// Every account the config names, in display order.
     var configuredNames: [String] {
         accountList.filter(\.isFilledIn).map(\.name) + oauthAccountList.filter(\.isFilledIn).map(\.name)
@@ -265,12 +268,26 @@ enum ClaudeError: LocalizedError {
         switch self {
         case .auth(let code):
             return String(format: T.authRejected, code)
+        case .http(429, _):
+            return T.rateLimited
         case .http(let code, let body):
-            return String(format: T.httpError, code, String(body.prefix(120)))
+            return String(format: T.httpError, code, apiErrorMessage(body))
         case .shape:
             return T.shapeError
         }
     }
+}
+
+/// The readable part of an error body: the API's own message when it sent one, otherwise
+/// the body squeezed onto one line — a menu item and a table cell show a single line.
+func apiErrorMessage(_ body: String) -> String {
+    if let data = body.data(using: .utf8),
+       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let message = (json["error"] as? [String: Any])?["message"] as? String, !message.isEmpty {
+        return message
+    }
+    let oneLine = body.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    return String(oneLine.prefix(120))
 }
 
 // These headers mimic the request the claude.ai/settings/limits dashboard fires. A missing
@@ -775,7 +792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pollClaudeCode(tokens: [String], emails: [String?]) {
         let logins = nameClaudeCodeLogins(tokens: tokens, emails: emails, known: tokenNames,
                                           previous: claudeCodeNames,
-                                          configured: Set(config.configuredNames))
+                                          configured: Set(config.configuredNames + config.hiddenLogins))
         tokenNames = Dictionary(logins.map { ($0.token, $0.name) }, uniquingKeysWith: { a, _ in a })
         retire(claudeCodeNames.filter { name in !logins.contains { $0.name == name } })
         claudeCodeNames = logins.map(\.name)
@@ -856,6 +873,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func apply(_ result: Result<UsageResponse, Error>, for name: String) {
         polled = true
         switch result {
+        case .failure(ClaudeError.http(429, _)) where readings[name].map({ $0.error == nil && $0.lastSeen == nil }) == true:
+            // Rate limited: the last reading is minutes old at most and resets_at has not
+            // moved, so it stays on show until the next poll gets through.
+            break
         case .failure(let err):
             note(error: err.localizedDescription, for: name)
 
@@ -955,7 +976,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
         menu.addItem(action(T.refreshNow, #selector(poll)))
-        menu.addItem(action(T.addAccount, #selector(addAccount)))
+        menu.addItem(action(T.addAccount, #selector(addAccountFromMenu)))
         menu.addItem(action(T.manageAccounts, #selector(manageAccounts)))
         menu.addItem(action(T.openConfig, #selector(openConfig)))
         menu.addItem(languageMenuItem())
@@ -1011,138 +1032,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(configURL)
     }
 
-    @objc private func addAccount() {
-        NSApp.activate(ignoringOtherApps: true)
-
-        let alert = NSAlert()
-        alert.messageText = T.addAccountTitle
-        alert.informativeText = T.addAccountHint
-        alert.addButton(withTitle: T.addButton)
-        alert.addButton(withTitle: T.cancelButton)
-
-        let nameField = NSTextField(frame: NSRect(x: 0, y: 30, width: 320, height: 24))
-        nameField.placeholderString = T.namePlaceholder
-        let keyField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        keyField.placeholderString = T.keyPlaceholder
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 54))
-        box.addSubview(nameField)
-        box.addSubview(keyField)
-        alert.accessoryView = box
-        alert.window.initialFirstResponder = nameField
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
-        let key = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { return showError(T.keyRequired) }
-        if !name.isEmpty, isTaken(name) { return showError(String(format: T.accountExists, name)) }
-
-        if isOAuthToken(key) { return addOAuthAccount(name: name, token: key) }
-        guard !name.isEmpty else { return showError(T.nameRequired) }
-
-        discoverOrgId(sessionKey: key) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                switch result {
-                case .failure(let err):
-                    self.showError(err.localizedDescription)
-                case .success(let orgId):
-                    let status = storeAddedKey(key, account: keyAccount(.sessionKey, name))
-                    guard status == errSecSuccess else {
-                        return self.showError(String(format: T.keychainFailed, Int(status)))
-                    }
-                    var cfg = loadConfig()
-                    cfg.accounts = cfg.accountList
-                        + [Account(name: name, session_key: "", org_id: orgId, keychain: true)]
-                    self.save(cfg)
-                }
-            }
-        }
-    }
-
-    /// A name already on screen or in the config — two rows under one name would share
-    /// their state.
-    private func isTaken(_ name: String) -> Bool {
-        sourceNames.contains(name) || config.configuredNames.contains(name)
-    }
-
-    /// Checks the token against the usage endpoint before saving it, so a token that cannot
-    /// read limits is turned away here instead of becoming an error row.
-    private func addOAuthAccount(name: String, token: String) {
-        checkToken(token) { [weak self] in
-            guard let self else { return }
-            guard name.isEmpty else { return self.saveOAuthAccount(name: name, token: token) }
-            fetchOAuthLabel(token: token) { email in
-                DispatchQueue.main.async {
-                    guard let email else { return self.showError(T.tokenNeedsName) }
-                    self.saveOAuthAccount(name: email, token: token)
-                }
-            }
-        }
-    }
-
-    /// Runs `then` on the main thread only if the token can read usage limits; otherwise
-    /// says why it cannot.
-    private func checkToken(_ token: String, then: @escaping () -> Void) {
-        fetchUsageOAuth(token: token) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                switch result {
-                case .failure(let err):
-                    if case .auth(let code)? = err as? ClaudeError {
-                        return self.showError(String(format: T.tokenRejected, code))
-                    }
-                    self.showError(err.localizedDescription)
-                case .success(let usage):
-                    guard makeReading(usage) != nil else { return self.showError(T.shapeError) }
-                    then()
-                }
-            }
-        }
-    }
-
-    private func saveOAuthAccount(name: String, token: String) {
-        guard !isTaken(name) else { return showError(String(format: T.accountExists, name)) }
-        let status = storeAddedKey(token, account: keyAccount(.token, name))
-        guard status == errSecSuccess else {
-            return showError(String(format: T.keychainFailed, Int(status)))
-        }
-        var cfg = loadConfig()
-        cfg.oauth_accounts = cfg.oauthAccountList + [OAuthAccount(name: name, token: "", keychain: true)]
-        save(cfg)
-    }
-
-    private func save(_ cfg: Config) {
-        do {
-            try saveConfig(cfg)
-            config = cfg
-            startTimers()
-            poll()
-        } catch {
-            showError(String(format: T.saveFailed, error.localizedDescription))
-        }
-    }
-
     // MARK: Accounts window
+    //
+    // Everything about accounts is edited in one window, without dialogs: the operations
+    // below report back through a completion, and the window shows the outcome inline.
 
     @objc private func manageAccounts() {
         if accountsWindow == nil {
             accountsWindow = AccountsWindowController(
                 rows: { [weak self] in self?.accountRows() ?? [] },
-                onAdd: { [weak self] in self?.addAccount() },
-                onReplaceKey: { [weak self] in self?.replaceKey(for: $0) },
-                onRemove: { [weak self] in self?.removeAccount(named: $0.name) })
+                onAdd: { [weak self] name, key, done in self?.addAccount(name: name, key: key, done: done) },
+                onRename: { [weak self] row, name, done in self?.rename(row, to: name, done: done) },
+                onReplaceKey: { [weak self] row, key, done in self?.replaceKey(of: row, with: key, done: done) },
+                onRemove: { [weak self] row, done in self?.remove(row, done: done) },
+                onSetHidden: { [weak self] row, hidden, done in self?.setHidden(row, hidden, done: done) })
         }
         accountsWindow?.show()
     }
 
+    @objc private func addAccountFromMenu() {
+        manageAccounts()
+        accountsWindow?.focusAddForm()
+    }
+
     private func accountRows() -> [AccountRow] {
-        claudeCodeNames.map { AccountRow(name: $0, kind: .claudeCode, inKeychain: true, status: statusText($0)) }
-            + config.accountList.filter(\.isFilledIn).map {
-                AccountRow(name: $0.name, kind: .sessionKey, inKeychain: $0.inKeychain, status: statusText($0.name))
-            }
-            + config.oauthAccountList.filter(\.isFilledIn).map {
-                AccountRow(name: $0.name, kind: .token, inKeychain: $0.inKeychain, status: statusText($0.name))
-            }
+        claudeCodeNames.map {
+            AccountRow(name: $0, kind: .claudeCode, inKeychain: true, hidden: false, status: statusText($0))
+        }
+        + config.hiddenLogins.map {
+            AccountRow(name: $0, kind: .claudeCode, inKeychain: true, hidden: true, status: T.statusHidden)
+        }
+        + config.accountList.filter(\.isFilledIn).map {
+            AccountRow(name: $0.name, kind: .sessionKey, inKeychain: $0.inKeychain, hidden: false,
+                       status: statusText($0.name))
+        }
+        + config.oauthAccountList.filter(\.isFilledIn).map {
+            AccountRow(name: $0.name, kind: .token, inKeychain: $0.inKeychain, hidden: false,
+                       status: statusText($0.name))
+        }
     }
 
     private func statusText(_ name: String) -> String {
@@ -1152,83 +1079,215 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return String(format: T.statusLine, figure(r.fiveHour), figure(r.sevenDay))
     }
 
-    /// Asks for a new key, checks it the same way adding an account does, and only then
-    /// replaces the old one in the Keychain.
-    private func replaceKey(for row: AccountRow) {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = String(format: T.replaceKeyTitle, row.name)
-        alert.informativeText = T.replaceKeyHint
-        alert.addButton(withTitle: T.saveButton)
-        alert.addButton(withTitle: T.cancelButton)
-        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = row.kind == .token ? "sk-ant-oat…" : "sk-ant-sid…"
-        alert.accessoryView = field
-        alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+    /// A name already on screen or in the config — two rows under one name would share
+    /// their state.
+    private func isTaken(_ name: String) -> Bool {
+        sourceNames.contains(name) || config.configuredNames.contains(name) || config.hiddenLogins.contains(name)
+    }
 
-        let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { return showError(T.keyRequired) }
-        guard isOAuthToken(key) == (row.kind == .token) else {
-            return showError(String(format: T.wrongKeyKind, row.typeText))
-        }
-        if row.kind == .token {
-            checkToken(key) { [weak self] in self?.commitKey(key, for: row, orgId: nil) }
+    /// What checking a key found out about its account.
+    private struct VerifiedKey {
+        var orgId: String?
+        var email: String?
+    }
+
+    /// Checks a key before anything is saved: a token must be able to read usage limits,
+    /// a sessionKey must lead to an organization.
+    private func verify(_ key: String, done: @escaping (Result<VerifiedKey, EditFailure>) -> Void) {
+        guard isOAuthToken(key) else {
+            discoverOrgId(sessionKey: key) { result in
+                DispatchQueue.main.async {
+                    done(result.map { VerifiedKey(orgId: $0) }
+                        .mapError { EditFailure($0.localizedDescription) })
+                }
+            }
             return
         }
-        discoverOrgId(sessionKey: key) { [weak self] result in
+        fetchUsageOAuth(token: key) { result in
             DispatchQueue.main.async {
                 switch result {
-                case .failure(let err): self?.showError(err.localizedDescription)
-                case .success(let orgId): self?.commitKey(key, for: row, orgId: orgId)
+                case .failure(let err):
+                    if case .auth(let code)? = err as? ClaudeError {
+                        return done(.failure(EditFailure(String(format: T.tokenRejected, code))))
+                    }
+                    done(.failure(EditFailure(err.localizedDescription)))
+                case .success(let usage):
+                    guard makeReading(usage) != nil else { return done(.failure(EditFailure(T.shapeError))) }
+                    fetchOAuthLabel(token: key) { email in
+                        DispatchQueue.main.async { done(.success(VerifiedKey(email: email))) }
+                    }
                 }
             }
         }
     }
 
-    private func commitKey(_ key: String, for row: AccountRow, orgId: String?) {
-        let kind: KeyKind = row.kind == .token ? .token : .sessionKey
-        let status = storeAddedKey(key, account: keyAccount(kind, row.name))
-        guard status == errSecSuccess else { return showError(String(format: T.keychainFailed, Int(status))) }
-        var cfg = loadConfig()
-        if kind == .token {
-            cfg.oauth_accounts = cfg.oauthAccountList.map {
-                $0.name == row.name ? OAuthAccount(name: $0.name, token: "", keychain: true) : $0
-            }
-        } else {
-            cfg.accounts = cfg.accountList.map {
-                $0.name == row.name
-                    ? Account(name: $0.name, session_key: "", org_id: orgId ?? $0.org_id, keychain: true) : $0
+    private func addAccount(name rawName: String, key rawKey: String, done: @escaping (EditResult) -> Void) {
+        let name = rawName.trimmingCharacters(in: .whitespaces)
+        let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return done(.failure(EditFailure(T.keyRequired))) }
+        let isToken = isOAuthToken(key)
+        guard isToken || !name.isEmpty else { return done(.failure(EditFailure(T.nameRequired))) }
+        if !name.isEmpty, isTaken(name) {
+            return done(.failure(EditFailure(String(format: T.accountExists, name))))
+        }
+        verify(key) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let f):
+                done(.failure(f))
+            case .success(let found):
+                guard let finalName = name.isEmpty ? found.email : name else {
+                    return done(.failure(EditFailure(T.tokenNeedsName)))
+                }
+                guard name.isEmpty == false || !self.isTaken(finalName) else {
+                    return done(.failure(EditFailure(String(format: T.accountExists, finalName))))
+                }
+                let status = storeAddedKey(key, account: keyAccount(isToken ? .token : .sessionKey, finalName))
+                guard status == errSecSuccess else {
+                    return done(.failure(EditFailure(String(format: T.keychainFailed, Int(status)))))
+                }
+                var cfg = loadConfig()
+                if isToken {
+                    cfg.oauth_accounts = cfg.oauthAccountList + [OAuthAccount(name: finalName, token: "", keychain: true)]
+                } else {
+                    cfg.accounts = cfg.accountList
+                        + [Account(name: finalName, session_key: "", org_id: found.orgId ?? "", keychain: true)]
+                }
+                done(self.persist(cfg).map { finalName })
             }
         }
-        // The new key may belong to a different account, so the old baseline cannot be
-        // trusted to tell a reset from a switch.
-        baselines.removeValue(forKey: row.name)
-        fastPolled.removeValue(forKey: row.name)
-        save(cfg)
     }
 
-    private func removeAccount(named name: String) {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = String(format: T.removeTitle, name)
-        alert.informativeText = T.removeHint
-        alert.addButton(withTitle: T.removeButton)
-        alert.addButton(withTitle: T.cancelButton)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+    /// Checks the new key the same way adding an account does, and only then replaces the
+    /// old one in the Keychain.
+    private func replaceKey(of row: AccountRow, with rawKey: String, done: @escaping (EditResult) -> Void) {
+        let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard row.editable else { return }
+        guard !key.isEmpty else { return done(.failure(EditFailure(T.keyRequired))) }
+        guard isOAuthToken(key) == (row.kind == .token) else {
+            return done(.failure(EditFailure(String(format: T.wrongKeyKind, row.typeText))))
+        }
+        verify(key) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let f):
+                done(.failure(f))
+            case .success(let found):
+                let kind: KeyKind = row.kind == .token ? .token : .sessionKey
+                let status = storeAddedKey(key, account: keyAccount(kind, row.name))
+                guard status == errSecSuccess else {
+                    return done(.failure(EditFailure(String(format: T.keychainFailed, Int(status)))))
+                }
+                var cfg = loadConfig()
+                cfg.oauth_accounts = cfg.oauth_accounts?.map {
+                    $0.name == row.name && kind == .token ? OAuthAccount(name: $0.name, token: "", keychain: true) : $0
+                }
+                cfg.accounts = cfg.accounts?.map {
+                    $0.name == row.name && kind == .sessionKey
+                        ? Account(name: $0.name, session_key: "", org_id: found.orgId ?? $0.org_id, keychain: true) : $0
+                }
+                // The new key may belong to a different account, so the old baseline cannot
+                // be trusted to tell a reset from a switch.
+                self.baselines.removeValue(forKey: row.name)
+                self.fastPolled.removeValue(forKey: row.name)
+                done(self.persist(cfg).map { row.name })
+            }
+        }
+    }
 
+    /// Renames an added account, carrying its key and its state over to the new name.
+    private func rename(_ row: AccountRow, to rawName: String, done: @escaping (EditResult) -> Void) {
+        let name = rawName.trimmingCharacters(in: .whitespaces)
+        guard row.editable, name != row.name else { return }
+        guard !name.isEmpty else { return done(.failure(EditFailure(T.nameRequired))) }
+        guard !isTaken(name) else { return done(.failure(EditFailure(String(format: T.accountExists, name)))) }
+
+        let kind: KeyKind = row.kind == .token ? .token : .sessionKey
+        if row.inKeychain {
+            guard let key = readAddedKey(account: keyAccount(kind, row.name)) else {
+                return done(.failure(EditFailure(T.keyMissing)))
+            }
+            let status = storeAddedKey(key, account: keyAccount(kind, name))
+            guard status == errSecSuccess else {
+                return done(.failure(EditFailure(String(format: T.keychainFailed, Int(status)))))
+            }
+        }
         var cfg = loadConfig()
-        cfg.accounts = cfg.accountList.filter { $0.name != name }
-        let tokens = cfg.oauthAccountList.filter { $0.name != name }
+        cfg.accounts = cfg.accounts?.map {
+            guard $0.name == row.name, kind == .sessionKey else { return $0 }
+            var a = $0
+            a.name = name
+            return a
+        }
+        cfg.oauth_accounts = cfg.oauth_accounts?.map {
+            guard $0.name == row.name, kind == .token else { return $0 }
+            var a = $0
+            a.name = name
+            return a
+        }
+        if case .failure(let f) = persist(cfg, pollAfter: false) {
+            if row.inKeychain { deleteAddedKey(account: keyAccount(kind, name)) }
+            return done(.failure(f))
+        }
+        if row.inKeychain { deleteAddedKey(account: keyAccount(kind, row.name)) }
+        readings[name] = readings.removeValue(forKey: row.name)
+        baselines[name] = baselines.removeValue(forKey: row.name)
+        fastPolled[name] = fastPolled.removeValue(forKey: row.name)
+        poll()
+        done(.success(name))
+    }
+
+    private func remove(_ row: AccountRow, done: @escaping (EditResult) -> Void) {
+        guard row.editable else { return }
+        var cfg = loadConfig()
+        cfg.accounts = cfg.accounts?.filter { $0.name != row.name }
+        let tokens = cfg.oauthAccountList.filter { $0.name != row.name }
         cfg.oauth_accounts = tokens.isEmpty ? nil : tokens
-        deleteAddedKey(account: keyAccount(.sessionKey, name))
-        deleteAddedKey(account: keyAccount(.token, name))
+        if case .failure(let f) = persist(cfg, pollAfter: false) { return done(.failure(f)) }
+        deleteAddedKey(account: keyAccount(.sessionKey, row.name))
+        deleteAddedKey(account: keyAccount(.token, row.name))
         // Forgotten outright — a removed account should not linger as a snapshot.
+        forget(row.name)
+        poll()
+        done(.success(row.name))
+    }
+
+    /// Hides a Claude Code login from the menu, or shows it again. The login itself — its
+    /// Keychain item, Claude Code's session — is never touched.
+    private func setHidden(_ row: AccountRow, _ hidden: Bool, done: @escaping (EditResult) -> Void) {
+        guard row.kind == .claudeCode else { return }
+        var cfg = loadConfig()
+        var list = cfg.hiddenLogins.filter { $0 != row.name }
+        if hidden { list.append(row.name) }
+        cfg.hidden_logins = list.isEmpty ? nil : list
+        if case .failure(let f) = persist(cfg, pollAfter: false) { return done(.failure(f)) }
+        if hidden {
+            claudeCodeNames.removeAll { $0 == row.name }
+            forget(row.name)
+        }
+        poll()
+        done(.success(row.name))
+    }
+
+    private func forget(_ name: String) {
         readings.removeValue(forKey: name)
         baselines.removeValue(forKey: name)
         fastPolled.removeValue(forKey: name)
         staleAccounts.removeValue(forKey: name)
-        save(cfg)
+    }
+
+    private func persist(_ cfg: Config, pollAfter: Bool = true) -> Result<Void, EditFailure> {
+        do {
+            try saveConfig(cfg)
+        } catch {
+            return .failure(EditFailure(String(format: T.saveFailed, error.localizedDescription)))
+        }
+        config = cfg
+        if pollAfter {
+            startTimers()
+            poll()
+        }
+        return .success(())
     }
 
     private func showError(_ text: String) {
@@ -1297,10 +1356,12 @@ func runSelfCheck() {
         assert(!l.resetTitle.isEmpty && !l.resetBody.isEmpty, "message templates: \(code)")
         assert(l.days.count == 7 && !l.days.contains(where: \.isEmpty), "weekday names: \(code)")
         assert(!l.lastSeen.isEmpty && !l.loading.isEmpty && !l.idleLine.isEmpty, "status strings: \(code)")
-        assert(!l.manageAccounts.isEmpty && !l.removeTitle.isEmpty && !l.removeButton.isEmpty
-               && l.statusLine.components(separatedBy: "%@").count == 3
-               && l.replaceKeyTitle.contains("%@") && l.wrongKeyKind.contains("%@")
-               && !l.colStorage.isEmpty && !l.storageKeychain.isEmpty && !l.keyRequired.isEmpty && !l.nameRequired.isEmpty
+        assert(!l.manageAccounts.isEmpty && !l.removeButton.isEmpty && !l.confirmRemove.isEmpty
+               && l.statusLine.components(separatedBy: "%@").count == 3 && l.wrongKeyKind.contains("%@")
+               && [l.msgAdded, l.msgKeyReplaced, l.msgRemoved, l.msgRenamed, l.msgHidden, l.msgShown]
+                    .allSatisfy { $0.contains("%@") }
+               && !l.colKey.isEmpty && !l.keyInKeychain.isEmpty && !l.hideLogin.isEmpty
+               && !l.showLogin.isEmpty && !l.editHint.isEmpty && !l.keyRequired.isEmpty && !l.nameRequired.isEmpty
                && !l.tokenNeedsName.isEmpty && l.tokenRejected.contains("%d")
                && !l.keyMissing.isEmpty && l.keychainFailed.contains("%d"), "account strings: \(code)")
     }
@@ -1451,6 +1512,12 @@ func runSelfCheck() {
     assert(kcBack.accountList.first?.inKeychain == true && kcBack.oauthAccountList.first?.inKeychain == true,
            "the Keychain marker is written back")
     assert(keyAccount(.sessionKey, "a") != keyAccount(.token, "a"), "the two kinds never share an item")
+
+    // Error bodies are shown on one line, preferring the API's own message.
+    assert(apiErrorMessage(#"{"error":{"type":"x","message":"Rate limited. Please try again later."}}"#)
+           == "Rate limited. Please try again later.")
+    assert(apiErrorMessage("{\n  \"oops\": 1\n}") == "{ \"oops\": 1 }", "a body without a message is squeezed")
+    assert(ClaudeError.http(429, "").localizedDescription == T.rateLimited)
 
     // The gauge must always occupy the same width, or the rows stop lining up.
     for v in [-5.0, 0, 0.4, 12.5, 50, 99.9, 100, 150] {
