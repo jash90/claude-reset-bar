@@ -38,9 +38,37 @@ struct UIStrings {
     let keyPlaceholder: String
 
     let failedTitle: String
-    let nameAndKeyRequired: String
+    let keyRequired: String
+    let nameRequired: String
+    let tokenNeedsName: String
+    let tokenRejected: String   // "This token was refused … (HTTP %d) …"
     let accountExists: String   // "An account named \"%@\" already exists."
     let saveFailed: String      // "Could not save the configuration: %@"
+    let keyMissing: String
+    let keychainFailed: String  // "Could not save the key in the Keychain (error %d)."
+
+    let removeTitle: String     // "Remove %@?"
+    let removeHint: String
+    let removeButton: String
+
+    let manageAccounts: String
+    let accountsTitle: String
+    let colAccount: String
+    let colType: String
+    let colStorage: String
+    let colStatus: String
+    let typeClaudeCode: String
+    let typeSessionKey: String
+    let typeToken: String
+    let storageClaudeCode: String
+    let storageKeychain: String
+    let storageConfig: String
+    let statusLine: String      // "5h %@ · 7d %@"
+    let replaceKey: String
+    let replaceKeyTitle: String // "New key for %@"
+    let replaceKeyHint: String
+    let saveButton: String
+    let wrongKeyKind: String    // "This account needs a %@."
 }
 
 let languages: [String: UIStrings] = [
@@ -74,16 +102,49 @@ let languages: [String: UIStrings] = [
         shapeError: "Unexpected response shape — the private API may have changed.",
 
         addAccountTitle: "Add a Claude account",
-        addAccountHint: "Find sessionKey in DevTools → Application → Cookies → claude.ai → sessionKey",
+        addAccountHint: "Paste a sessionKey (DevTools → Application → Cookies → claude.ai → sessionKey) "
+                      + "or an OAuth token from `claude setup-token`. For a token the name is optional "
+                      + "— the account's email is used.",
         addButton: "Add",
         cancelButton: "Cancel",
         namePlaceholder: "Account name (e.g. personal)",
-        keyPlaceholder: "sk-ant-sid…",
+        keyPlaceholder: "sk-ant-sid… or sk-ant-oat…",
 
         failedTitle: "That didn't work",
-        nameAndKeyRequired: "Both a name and a sessionKey are required.",
+        keyRequired: "Paste a sessionKey or an OAuth token.",
+        nameRequired: "An account added with a sessionKey needs a name.",
+        tokenNeedsName: "This token cannot read the account's email — enter a name for it.",
+        tokenRejected: "This token was refused when reading usage limits (HTTP %d). "
+                     + "Add the account with a sessionKey instead.",
         accountExists: "An account named \"%@\" already exists.",
-        saveFailed: "Could not save the configuration: %@"
+        saveFailed: "Could not save the configuration: %@",
+        keyMissing: "The key for this account is missing from the Keychain — remove the account "
+                  + "and add it again.",
+        keychainFailed: "Could not save the key in the Keychain (error %d).",
+
+        removeTitle: "Remove %@?",
+        removeHint: "It is taken out of the config file and its key out of the Keychain. Accounts "
+                  + "signed into Claude Code are not listed here — they go away when you sign out of them.",
+        removeButton: "Remove",
+
+        manageAccounts: "Manage accounts…",
+        accountsTitle: "Accounts",
+        colAccount: "Account",
+        colType: "Type",
+        colStorage: "Key stored in",
+        colStatus: "Status",
+        typeClaudeCode: "Claude Code login",
+        typeSessionKey: "sessionKey",
+        typeToken: "OAuth token",
+        storageClaudeCode: "Claude Code (Keychain)",
+        storageKeychain: "Keychain",
+        storageConfig: "Config file (plain text)",
+        statusLine: "5h %@ · 7d %@",
+        replaceKey: "Replace key…",
+        replaceKeyTitle: "New key for %@",
+        replaceKeyHint: "The new key is checked before it replaces the old one, and is saved in the Keychain.",
+        saveButton: "Save",
+        wrongKeyKind: "This account needs a %@."
     ),
     "pl": UIStrings(
         refreshNow: "Odśwież teraz",
@@ -115,16 +176,48 @@ let languages: [String: UIStrings] = [
         shapeError: "Nieoczekiwany kształt odpowiedzi — prywatne API mogło się zmienić.",
 
         addAccountTitle: "Dodaj konto Claude",
-        addAccountHint: "sessionKey znajdziesz w DevTools → Application → Cookies → claude.ai → sessionKey",
+        addAccountHint: "Wklej sessionKey (DevTools → Application → Cookies → claude.ai → sessionKey) "
+                      + "albo token OAuth z `claude setup-token`. Przy tokenie nazwa jest opcjonalna "
+                      + "— zostanie użyty e-mail konta.",
         addButton: "Dodaj",
         cancelButton: "Anuluj",
         namePlaceholder: "Nazwa konta (np. prywatne)",
-        keyPlaceholder: "sk-ant-sid…",
+        keyPlaceholder: "sk-ant-sid… albo sk-ant-oat…",
 
         failedTitle: "Nie udało się",
-        nameAndKeyRequired: "Nazwa i sessionKey są wymagane.",
+        keyRequired: "Wklej sessionKey albo token OAuth.",
+        nameRequired: "Konto dodawane przez sessionKey musi mieć nazwę.",
+        tokenNeedsName: "Ten token nie odczyta e-maila konta — wpisz dla niego nazwę.",
+        tokenRejected: "Token został odrzucony przy odczycie limitów (HTTP %d). "
+                     + "Dodaj to konto przez sessionKey.",
         accountExists: "Konto o nazwie \"%@\" już istnieje.",
-        saveFailed: "Nie udało się zapisać konfiguracji: %@"
+        saveFailed: "Nie udało się zapisać konfiguracji: %@",
+        keyMissing: "Brak klucza tego konta w pęku kluczy — usuń konto i dodaj je ponownie.",
+        keychainFailed: "Nie udało się zapisać klucza w pęku kluczy (błąd %d).",
+
+        removeTitle: "Usunąć %@?",
+        removeHint: "Zostanie usunięte z pliku konfiguracji, a jego klucz z pęku kluczy. Konta "
+                  + "zalogowane w Claude Code nie są tu wymienione — znikają, gdy się z nich wylogujesz.",
+        removeButton: "Usuń",
+
+        manageAccounts: "Zarządzaj kontami…",
+        accountsTitle: "Konta",
+        colAccount: "Konto",
+        colType: "Rodzaj",
+        colStorage: "Klucz zapisany w",
+        colStatus: "Stan",
+        typeClaudeCode: "Logowanie Claude Code",
+        typeSessionKey: "sessionKey",
+        typeToken: "token OAuth",
+        storageClaudeCode: "Claude Code (pęk kluczy)",
+        storageKeychain: "Pęk kluczy",
+        storageConfig: "Plik konfiguracji (jawnie)",
+        statusLine: "5h %@ · 7d %@",
+        replaceKey: "Zmień klucz…",
+        replaceKeyTitle: "Nowy klucz dla %@",
+        replaceKeyHint: "Nowy klucz zostanie sprawdzony, zanim zastąpi stary, i zapisany w pęku kluczy.",
+        saveButton: "Zapisz",
+        wrongKeyKind: "To konto wymaga klucza typu: %@."
     ),
 ]
 

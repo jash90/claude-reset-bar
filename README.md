@@ -5,7 +5,7 @@
 A menu bar / system tray icon that shows your Claude usage limits and **notifies you the moment a limit resets** — so you stop guessing when you can get back to work.
 
 - **Nothing to configure.** It reads the token Claude Code already stored on your machine.
-- **Several accounts at once.** The Claude Code account plus any number of extra ones, each on its own row.
+- **Several accounts at once.** Every Claude Code login on the machine, plus any number of extra accounts added by sessionKey or OAuth token, each on its own row.
 - **macOS, Windows, Linux.** One binary per system, no runtime, no installer.
 
 ```
@@ -39,8 +39,8 @@ Grab the package for your system from [Releases](../../releases).
 
 In this order:
 
-1. **The OAuth token Claude Code stored.** On Windows and Linux it lives in `~/.claude/.credentials.json`; on macOS in the Keychain (`Claude Code-credentials`). That token queries `api.anthropic.com/api/oauth/usage`. You supply nothing.
-2. **Extra accounts via `sessionKey`** — optional, for accounts you are not signed into in Claude Code.
+1. **The OAuth tokens Claude Code stored.** On Windows and Linux they live in `~/.claude/.credentials.json` (plus `$CLAUDE_CONFIG_DIR` and any `~/.claude-<name>` profile); on macOS in the Keychain (`Claude Code-credentials`, one item per profile). Each live token queries `api.anthropic.com/api/oauth/usage`. You supply nothing.
+2. **Extra accounts via `sessionKey` or an OAuth token** — optional, for accounts you are not signed into in Claude Code.
 
 The token is only ever read. The app **does not use the refresh token** — refreshing it itself would invalidate Claude Code's session. If the token expires, just run Claude Code; the new one is picked up on the next poll.
 
@@ -58,9 +58,11 @@ Use `"auto"` to go back to following the system locale.
 
 ## Several accounts
 
-The account signed into Claude Code shows up on its own. Switching accounts with `/login` replaces it: Claude Code keeps one token at a time, so the previous account can no longer be polled.
+There are three ways to get an account on screen, and they mix freely.
 
-Rather than dropping its row, the app keeps the last reading it got, marked with the time it was taken:
+**1. Sign into it in Claude Code.** Every Claude Code login on the machine gets its own row, named by its email. If you keep several profiles — separate `CLAUDE_CONFIG_DIR` directories, each signed into a different account — all of them show up live. An expired token belongs to a profile you have not used lately; it is skipped until Claude Code refreshes it.
+
+Switching accounts with `/login` replaces a login: Claude Code keeps one token per profile, so the previous account can no longer be polled. Rather than dropping its row, the app keeps the last reading it got, marked with the time it was taken:
 
 ```
 ● new@example.com
@@ -70,25 +72,40 @@ Rather than dropping its row, the app keeps the last reading it got, marked with
    5h  ■■■■■□□□□□□□  40%   resets in 2h 14m (Mon 14:03)
 ```
 
-The countdown on a snapshot row stays truthful, because `resets_at` does not move until the window actually resets — so you can still see when the other account frees up. Nothing refreshes it though, and no reset notification will arrive for it. Sign back into that account, or add it via `sessionKey`, and the row goes live again.
+The countdown on a snapshot row stays truthful, because `resets_at` does not move until the window actually resets — so you can still see when the other account frees up. Nothing refreshes it though, and no reset notification will arrive for it. Sign back into that account, or add it by one of the ways below, and the row goes live again. Snapshots live in memory only; restarting the app forgets them.
 
-Snapshots live in memory only; restarting the app forgets them. To watch **both accounts live**, add the second one via `sessionKey`.
+**2. Add it with a `sessionKey`.** Find it in DevTools → *Application* → *Cookies* → `claude.ai` → `sessionKey`.
 
-The config lives in `~/.config/claude-reset/config.json`, in a format compatible with the [claude-reset](https://github.com/nazarli-shabnam/claude-reset) CLI:
+**3. Add it with an OAuth token.** Run `claude setup-token` while signed into that account and paste the `sk-ant-oat…` token it prints. The token is checked against the usage endpoint before it is saved; if it is refused, use a `sessionKey` instead.
+
+On macOS, **Add account…** takes either kind of key and tells them apart by the prefix. A sessionKey needs a name. For a token the name is optional, and the account's email is used.
+
+**Manage accounts…** opens a window with every account in one list: what kind it is, where its key is stored, and how its last poll went. For an account you added, **Replace key…** swaps in a new key, which is checked first just like a new account, and **Remove** deletes the account together with its key. Claude Code logins are listed too, greyed out. They belong to Claude Code and go away when you sign out of them.
+
+### Where added keys are kept
+
+On macOS a key you add goes into the login Keychain (service `ClaudeResetBar`, account `sessionKey:<name>` or `token:<name>`), not into the config file. The config only names the account and marks it `"keychain": true`. A key that is still written in plain text in the config, for example a hand-written entry, is moved into the Keychain on the next poll and blanked in the file. Such an entry no longer carries its key, so the claude-reset CLI cannot use it any more.
+
+Windows and Linux have no Keychain, so the portable build keeps keys in the config file (readable only by you, `0600`). The portable build running on macOS cannot read the app's Keychain items without a password prompt on every poll, so it reports where the key is instead of polling that account.
+
+In the portable build (Windows, Linux) you edit the config file; the menu has an entry that opens it. The config lives in `~/.config/claude-reset/config.json`, and its `accounts` list keeps the format of the [claude-reset](https://github.com/nazarli-shabnam/claude-reset) CLI:
 
 ```json
 {
   "accounts": [
-    { "name": "second-account", "session_key": "sk-ant-sid...", "org_id": "uuid" }
+    { "name": "second-account", "session_key": "sk-ant-sid..." }
+  ],
+  "oauth_accounts": [
+    { "name": "third-account", "token": "sk-ant-oat01-..." }
   ],
   "check_interval_minutes": 15,
   "language": "en"
 }
 ```
 
-Find `sessionKey` in DevTools → *Application* → *Cookies* → `claude.ai` → `sessionKey`. The macOS build has an **Add account…** entry that asks for a name and a key and discovers `org_id` on its own. In the portable build you fill in both fields by hand; the menu has an entry that opens the file.
+`org_id` can be left out of a `sessionKey` entry: both builds look it up from the key on the next poll and write it into the file, leaving everything else in it as it was.
 
-Do not add the account you are already signed into in Claude Code via `sessionKey` — it would appear twice.
+An account added by key under the same name as a Claude Code login (its email) replaces that login's row instead of appearing twice. Under a different name, it shows up twice.
 
 ## How reset detection works
 

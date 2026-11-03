@@ -9,10 +9,131 @@ import Foundation
 
 // MARK: - Model
 
+/// An extra account read with a claude.ai sessionKey. This is the shape the claude-reset
+/// CLI reads too, so it stays exactly as it was.
 struct Account: Codable {
     var name: String
     var session_key: String
+    /// May be left empty in a hand-written entry: it is discovered from the session key on
+    /// the next poll and written back.
     var org_id: String
+    /// Set once the key lives in the Keychain; `session_key` is empty then.
+    var keychain: Bool?
+
+    init(name: String, session_key: String, org_id: String, keychain: Bool? = nil) {
+        self.name = name
+        self.session_key = session_key
+        self.org_id = org_id
+        self.keychain = keychain
+    }
+
+    // A missing field leaves it empty instead of throwing — one incomplete entry must not
+    // cost the whole config file.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        session_key = try c.decodeIfPresent(String.self, forKey: .session_key) ?? ""
+        org_id = try c.decodeIfPresent(String.self, forKey: .org_id) ?? ""
+        keychain = try c.decodeIfPresent(Bool.self, forKey: .keychain)
+    }
+
+    var inKeychain: Bool { keychain == true }
+    var isFilledIn: Bool { !name.isEmpty && (inKeychain || !session_key.isEmpty) }
+}
+
+/// An extra account read with an OAuth token, such as one from `claude setup-token`. Kept
+/// apart from `accounts`, whose shape the claude-reset CLI relies on.
+struct OAuthAccount: Codable {
+    var name: String
+    var token: String
+    /// Set once the token lives in the Keychain; `token` is empty then.
+    var keychain: Bool?
+
+    init(name: String, token: String, keychain: Bool? = nil) {
+        self.name = name
+        self.token = token
+        self.keychain = keychain
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        token = try c.decodeIfPresent(String.self, forKey: .token) ?? ""
+        keychain = try c.decodeIfPresent(Bool.self, forKey: .keychain)
+    }
+
+    var inKeychain: Bool { keychain == true }
+    var isFilledIn: Bool { !name.isEmpty && (inKeychain || !token.isEmpty) }
+}
+
+// MARK: - Keys of added accounts (Keychain)
+
+// A key added to the app is kept in the login Keychain, not in config.json. The config only
+// names the account and marks it `"keychain": true`. Items carry the service name below and
+// the account "sessionKey:<name>" or "token:<name>". The app reads them through the Security
+// framework, and because it created them, it reads them without a password prompt.
+
+let addedKeyService = "ClaudeResetBar"
+
+enum KeyKind: String {
+    case sessionKey, token
+}
+
+func keyAccount(_ kind: KeyKind, _ name: String) -> String { "\(kind.rawValue):\(name)" }
+
+private func keyQuery(_ account: String) -> [String: Any] {
+    [kSecClass as String: kSecClassGenericPassword,
+     kSecAttrService as String: addedKeyService,
+     kSecAttrAccount as String: account]
+}
+
+/// Stores the key, replacing any earlier one under the same account. Returns the OSStatus.
+@discardableResult
+func storeAddedKey(_ value: String, account: String) -> OSStatus {
+    SecItemDelete(keyQuery(account) as CFDictionary)
+    var item = keyQuery(account)
+    item[kSecValueData as String] = Data(value.utf8)
+    item[kSecAttrLabel as String] = "\(addedKeyService) (\(account))"
+    return SecItemAdd(item as CFDictionary, nil)
+}
+
+func readAddedKey(account: String) -> String? {
+    var query = keyQuery(account)
+    query[kSecReturnData as String] = true
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
+          let data = out as? Data, let value = String(data: data, encoding: .utf8), !value.isEmpty
+    else { return nil }
+    return value
+}
+
+func deleteAddedKey(account: String) {
+    SecItemDelete(keyQuery(account) as CFDictionary)
+}
+
+/// Moves every key still written in plain text in the config into the Keychain and blanks
+/// it in the file. An entry whose key cannot be stored stays as it is. Returns the config
+/// as it now stands.
+func moveKeysToKeychain(_ cfg: Config) -> Config {
+    var out = cfg
+    var changed = false
+    out.accounts = cfg.accounts?.map { a in
+        guard !a.inKeychain, !a.name.isEmpty, !a.session_key.isEmpty,
+              storeAddedKey(a.session_key, account: keyAccount(.sessionKey, a.name)) == errSecSuccess
+        else { return a }
+        changed = true
+        return Account(name: a.name, session_key: "", org_id: a.org_id, keychain: true)
+    }
+    out.oauth_accounts = cfg.oauth_accounts?.map { a in
+        guard !a.inKeychain, !a.name.isEmpty, !a.token.isEmpty,
+              storeAddedKey(a.token, account: keyAccount(.token, a.name)) == errSecSuccess
+        else { return a }
+        changed = true
+        return OAuthAccount(name: a.name, token: "", keychain: true)
+    }
+    guard changed, (try? saveConfig(out)) != nil else { return cfg }
+    return out
 }
 
 struct Config: Codable {
@@ -20,11 +141,17 @@ struct Config: Codable {
     // a language setting is normal on a fresh install, and a strict decoder would throw the
     // whole file away over the missing key.
     var accounts: [Account]?
+    var oauth_accounts: [OAuthAccount]?
     var check_interval_minutes: Int?
     var slack_webhook_url: String?   // unused here, kept for claude-reset compatibility
     var language: String?
 
     var accountList: [Account] { accounts ?? [] }
+    var oauthAccountList: [OAuthAccount] { oauth_accounts ?? [] }
+    /// Every account the config names, in display order.
+    var configuredNames: [String] {
+        accountList.filter(\.isFilledIn).map(\.name) + oauthAccountList.filter(\.isFilledIn).map(\.name)
+    }
 }
 
 // Every field is optional. The API has already moved one reading out of its dedicated
@@ -304,29 +431,92 @@ func keychainCredentialServices() -> [String] {
     return services
 }
 
-/// The subscription token, picked out of every Keychain item that could carry one.
+/// One login Claude Code stored: the access token and when it stops working (Unix ms, 0 when
+/// the item does not say).
+struct StoredCredential {
+    let token: String
+    let expiresAt: Double
+}
+
+func storedCredential(_ data: Data) -> StoredCredential? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let oauth = json["claudeAiOauth"] as? [String: Any],
+          let token = oauth["accessToken"] as? String, !token.isEmpty
+    else { return nil }
+    return StoredCredential(token: token, expiresAt: (oauth["expiresAt"] as? Double) ?? 0)
+}
+
+/// The tokens worth polling, freshest first, each once. An expired token is dropped: it
+/// belongs to a profile nobody has used lately, and only Claude Code may refresh it. When
+/// every token has expired the freshest one is still returned, so the row says "run Claude
+/// Code" instead of the account silently disappearing.
+func liveTokens(_ creds: [StoredCredential], now: Date) -> [String] {
+    let nowMs = now.timeIntervalSince1970 * 1000
+    let sorted = creds.sorted { $0.expiresAt > $1.expiresAt }
+    var live = sorted.filter { $0.expiresAt == 0 || $0.expiresAt > nowMs }
+    if live.isEmpty, let freshest = sorted.first { live = [freshest] }
+    var seen = Set<String>()
+    return live.compactMap { seen.insert($0.token).inserted ? $0.token : nil }
+}
+
+/// Credential files Claude Code may have written: the default profile, the one
+/// CLAUDE_CONFIG_DIR points at, and the common habit of keeping extra profiles in
+/// ~/.claude-<name>. On macOS Claude Code normally uses the Keychain, so these are usually
+/// absent here.
+func credentialFiles() -> [URL] {
+    let fm = FileManager.default
+    let home = fm.homeDirectoryForCurrentUser
+    var dirs = [home.appendingPathComponent(".claude")]
+    if let custom = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !custom.isEmpty {
+        dirs.append(URL(fileURLWithPath: (custom as NSString).expandingTildeInPath))
+    }
+    let entries = (try? fm.contentsOfDirectory(atPath: home.path)) ?? []
+    for name in entries.sorted() where name.hasPrefix(".claude-") {
+        dirs.append(home.appendingPathComponent(name))
+    }
+    return dirs.map { $0.appendingPathComponent(".credentials.json") }
+}
+
+/// Every Claude Code login on this machine that can be polled.
 ///
-/// Several items share the service name: Claude Code writes one per profile, and an MCP
-/// OAuth flow writes its own under account "unknown" holding only `mcpOAuth`. Asking
-/// `security` for a service alone returns whichever it happens to find first, which since
-/// 2026-08 is often the MCP one — that is how the app went blank while Claude Code itself
-/// stayed signed in. So we read them all and keep the token that expires last.
-func keychainOAuthToken() -> String? {
-    var best: (expiry: Double, token: String)?
-    let accounts: [String?] = [NSUserName(), nil]
+/// Claude Code writes one Keychain item per profile ("Claude Code-credentials-<hash>"), and
+/// an MCP OAuth flow writes its own under account "unknown" holding only `mcpOAuth`. Asking
+/// `security` for a service alone returns whichever it finds first, so every item is read.
+/// Each live login gets its own row — several profiles signed into different accounts are
+/// all shown.
+func claudeCodeTokens() -> [String] {
+    var creds: [StoredCredential] = []
+    for url in credentialFiles() {
+        if let data = try? Data(contentsOf: url), let c = storedCredential(data) { creds.append(c) }
+    }
     for service in keychainCredentialServices() {
-        for account in accounts {
-            guard let data = keychainSecret(service: service, account: account),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let oauth = json["claudeAiOauth"] as? [String: Any],
-                  let token = oauth["accessToken"] as? String, !token.isEmpty
-            else { continue }
-            let expiry = (oauth["expiresAt"] as? Double) ?? 0
-            if best == nil || expiry > best!.expiry { best = (expiry, token) }
+        for account in [NSUserName(), nil] as [String?] {
+            if let data = keychainSecret(service: service, account: account),
+               let c = storedCredential(data) { creds.append(c) }
         }
     }
-    return best?.token
+    return liveTokens(creds, now: Date())
 }
+
+/// Names the logins found this poll. A login whose email could not be fetched keeps the
+/// name it had before; failing that it gets a numbered "Claude Code" name. A name the config
+/// already uses is skipped — that account is on screen already — and so is a second login
+/// into the same account.
+func nameClaudeCodeLogins(tokens: [String], emails: [String?], known: [String: String],
+                          previous: [String], configured: Set<String>) -> [(name: String, token: String)] {
+    var out: [(name: String, token: String)] = []
+    for (i, token) in tokens.enumerated() {
+        let fallback = tokens.count == 1 && previous.count == 1 ? previous[0]
+            : (i == 0 ? "Claude Code" : "Claude Code \(i + 1)")
+        let name = emails[i] ?? known[token] ?? fallback
+        guard !configured.contains(name), !out.contains(where: { $0.name == name }) else { continue }
+        out.append((name, token))
+    }
+    return out
+}
+
+/// A token Claude Code issues, as opposed to a claude.ai sessionKey.
+func isOAuthToken(_ key: String) -> Bool { key.hasPrefix("sk-ant-oat") }
 
 func anthropicRequest(path: String, token: String) -> URLRequest {
     var req = URLRequest(url: URL(string: "https://api.anthropic.com" + path)!)
@@ -470,9 +660,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var baselines: [String: [String: WindowState]] = [:]
     /// resets_at values that already triggered an off-schedule poll — see fastPollIfResetDue().
     private var fastPolled: [String: Date] = [:]
-    /// Source names in display order — the Claude Code account first, then config accounts.
+    /// Source names in display order — the Claude Code logins first, then config accounts,
+    /// then snapshots of accounts that dropped out of reach.
     private var sourceNames: [String] = []
-    private var keychainLabel = "Claude Code"
+    /// Names of the Claude Code logins seen on the last poll.
+    private var claudeCodeNames: [String] = []
+    /// The name each Claude Code token was last shown under, for a poll where its email
+    /// cannot be fetched.
+    private var tokenNames: [String: String] = [:]
+    /// Created the first time "Manage accounts…" is chosen, then kept for reuse.
+    private var accountsWindow: AccountsWindowController?
     /// Accounts that dropped out of reach, keyed by name, keeping their last reading so the
     /// row does not simply vanish. Memory only — a restart forgets them.
     private var staleAccounts: [String: Reading] = [:]
@@ -516,8 +713,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// stale past date would be polled every minute forever.
     private func fastPollIfResetDue() {
         let now = Date()
-        for (name, reading) in readings {
-            guard reading.lastSeen == nil, reading.error == nil,
+        for name in sourceNames {
+            guard let reading = readings[name], reading.lastSeen == nil, reading.error == nil,
                   let due = reading.headline?.resetsAt, due <= now else { continue }
             guard fastPolled[name] != due else { continue }
             fastPolled[name] = due
@@ -529,26 +726,122 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Polling
 
     @objc func poll() {
-        config = loadConfig()
-        var names: [String] = []
+        config = moveKeysToKeychain(loadConfig())
 
-        // The account signed into Claude Code — no configuration needed.
-        if let token = keychainOAuthToken() {
-            names.append(keychainLabel)
-            pollKeychainAccount(token: token)
+        // Extra accounts from the config. Isolated: an expired key on one must not block
+        // the others.
+        for var account in config.accountList where account.isFilledIn {
+            if account.inKeychain {
+                guard let key = readAddedKey(account: keyAccount(.sessionKey, account.name)) else {
+                    note(error: T.keyMissing, for: account.name)
+                    continue
+                }
+                account.session_key = key
+            }
+            pollSessionAccount(account)
         }
-
-        // Extra accounts from the config (sessionKey). Isolated: an expired key on one must
-        // not block the others.
-        for account in config.accountList {
-            names.append(account.name)
-            fetchUsage(account) { [weak self] result in
+        for account in config.oauthAccountList where account.isFilledIn {
+            guard let token = account.inKeychain
+                    ? readAddedKey(account: keyAccount(.token, account.name)) : account.token
+            else {
+                note(error: T.keyMissing, for: account.name)
+                continue
+            }
+            fetchUsageOAuth(token: token) { [weak self] result in
                 DispatchQueue.main.async { self?.apply(result, for: account.name) }
             }
         }
+        refreshSourceNames()
 
-        // A stale account that came back within reach — signed into again, or added by
-        // sessionKey — is live now, so its snapshot goes away.
+        // Every Claude Code login — no configuration needed. Emails are fetched first:
+        // the name keys our state, so the usage request only goes out once it is settled.
+        let tokens = claudeCodeTokens()
+        var emails = [String?](repeating: nil, count: tokens.count)
+        let group = DispatchGroup()
+        for (i, token) in tokens.enumerated() {
+            group.enter()
+            fetchOAuthLabel(token: token) { email in
+                DispatchQueue.main.async {
+                    emails[i] = email
+                    group.leave()
+                }
+            }
+        }
+        group.notify(queue: .main) { [weak self] in
+            self?.pollClaudeCode(tokens: tokens, emails: emails)
+        }
+    }
+
+    private func pollClaudeCode(tokens: [String], emails: [String?]) {
+        let logins = nameClaudeCodeLogins(tokens: tokens, emails: emails, known: tokenNames,
+                                          previous: claudeCodeNames,
+                                          configured: Set(config.configuredNames))
+        tokenNames = Dictionary(logins.map { ($0.token, $0.name) }, uniquingKeysWith: { a, _ in a })
+        retire(claudeCodeNames.filter { name in !logins.contains { $0.name == name } })
+        claudeCodeNames = logins.map(\.name)
+        refreshSourceNames()
+
+        for login in logins {
+            fetchUsageOAuth(token: login.token) { [weak self] result in
+                DispatchQueue.main.async { self?.apply(result, for: login.name) }
+            }
+        }
+    }
+
+    /// A sessionKey account whose org_id was left out gets it discovered and written back,
+    /// so a hand-written entry needs nothing but a name and a key.
+    private func pollSessionAccount(_ account: Account) {
+        guard account.org_id.isEmpty else {
+            fetchUsage(account) { [weak self] result in
+                DispatchQueue.main.async { self?.apply(result, for: account.name) }
+            }
+            return
+        }
+        discoverOrgId(sessionKey: account.session_key) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .failure(let err):
+                    self.apply(.failure(err), for: account.name)
+                case .success(let orgId):
+                    var cfg = loadConfig()
+                    cfg.accounts = cfg.accountList.map {
+                        guard $0.name == account.name && $0.org_id.isEmpty else { return $0 }
+                        var found = $0
+                        found.org_id = orgId
+                        return found
+                    }
+                    try? saveConfig(cfg)
+                    self.config = cfg
+                    var found = account
+                    found.org_id = orgId
+                    self.pollSessionAccount(found)
+                }
+            }
+        }
+    }
+
+    /// Claude Code logins that are gone — signed out, or swapped by /login. Their old
+    /// baseline describes a limit window we can no longer follow, so it is dropped, and the
+    /// final reading is kept as a snapshot: resets_at does not move until the window
+    /// actually resets, so its countdown stays truthful even though nothing refreshes it.
+    private func retire(_ names: [String]) {
+        for name in names {
+            if var last = readings.removeValue(forKey: name), last.error == nil {
+                last.lastSeen = Date()
+                staleAccounts[name] = last
+            }
+            baselines.removeValue(forKey: name)
+            fastPolled.removeValue(forKey: name)
+        }
+    }
+
+    private func refreshSourceNames() {
+        var names = claudeCodeNames
+        for name in config.configuredNames where !names.contains(name) { names.append(name) }
+
+        // A stale account that came back within reach — signed into again, or added to the
+        // config — is live now, so its snapshot goes away.
         for name in names { staleAccounts.removeValue(forKey: name) }
         for (name, snapshot) in staleAccounts.sorted(by: { $0.key < $1.key }) {
             names.append(name)
@@ -557,42 +850,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         sourceNames = names
         updateTitle()
-        rebuildMenu()
-    }
-
-    /// The label is fetched on every poll — /login in Claude Code swaps the account behind
-    /// the same Keychain entry. The usage request only goes out once the name is settled,
-    /// because the name keys our state: the other order would file a new account's reading
-    /// under the previous account's baseline.
-    private func pollKeychainAccount(token: String) {
-        fetchOAuthLabel(token: token) { [weak self] email in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if let email { self.switchKeychainAccount(to: email) }
-                let label = self.keychainLabel
-                fetchUsageOAuth(token: token) { result in
-                    DispatchQueue.main.async { self.apply(result, for: label) }
-                }
-            }
-        }
-    }
-
-    /// The Claude Code account changed. The old baseline describes a different account's
-    /// limit window, so it is dropped — the new account starts from its own first reading
-    /// and never gets a bogus reset notification.
-    private func switchKeychainAccount(to email: String) {
-        guard email != keychainLabel else { return }
-        let old = keychainLabel
-        // Keep the final reading around. resets_at does not move until the window actually
-        // resets, so the countdown stays truthful even though nothing refreshes it.
-        if var last = readings.removeValue(forKey: old), last.error == nil {
-            last.lastSeen = Date()
-            staleAccounts[old] = last
-        }
-        baselines.removeValue(forKey: old)
-        fastPolled.removeValue(forKey: old)
-        keychainLabel = email
-        sourceNames = sourceNames.map { $0 == old ? email : $0 }
         rebuildMenu()
     }
 
@@ -650,7 +907,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.title = "Claude ⚙︎"
             return
         }
-        let live = readings.values.filter { $0.error == nil && $0.lastSeen == nil }
+        let live = sourceNames.compactMap { readings[$0] }.filter { $0.error == nil && $0.lastSeen == nil }
         guard let worst = live.compactMap(\.headline).max(by: { $0.pct < $1.pct }) else {
             statusItem.button?.title = "Claude ⚠︎"
             return
@@ -662,6 +919,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func rebuildMenu() {
+        accountsWindow?.reload()
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
 
@@ -698,6 +956,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(action(T.refreshNow, #selector(poll)))
         menu.addItem(action(T.addAccount, #selector(addAccount)))
+        menu.addItem(action(T.manageAccounts, #selector(manageAccounts)))
         menu.addItem(action(T.openConfig, #selector(openConfig)))
         menu.addItem(languageMenuItem())
         menu.addItem(.separator())
@@ -773,11 +1032,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
-        let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, !key.isEmpty else { return showError(T.nameAndKeyRequired) }
-        guard !config.accountList.contains(where: { $0.name == name }) else {
-            return showError(String(format: T.accountExists, name))
-        }
+        let key = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return showError(T.keyRequired) }
+        if !name.isEmpty, isTaken(name) { return showError(String(format: T.accountExists, name)) }
+
+        if isOAuthToken(key) { return addOAuthAccount(name: name, token: key) }
+        guard !name.isEmpty else { return showError(T.nameRequired) }
 
         discoverOrgId(sessionKey: key) { [weak self] result in
             DispatchQueue.main.async {
@@ -786,19 +1046,189 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .failure(let err):
                     self.showError(err.localizedDescription)
                 case .success(let orgId):
-                    var cfg = loadConfig()
-                    cfg.accounts = cfg.accountList + [Account(name: name, session_key: key, org_id: orgId)]
-                    do {
-                        try saveConfig(cfg)
-                        self.config = cfg
-                        self.startTimers()
-                        self.poll()
-                    } catch {
-                        self.showError(String(format: T.saveFailed, error.localizedDescription))
+                    let status = storeAddedKey(key, account: keyAccount(.sessionKey, name))
+                    guard status == errSecSuccess else {
+                        return self.showError(String(format: T.keychainFailed, Int(status)))
                     }
+                    var cfg = loadConfig()
+                    cfg.accounts = cfg.accountList
+                        + [Account(name: name, session_key: "", org_id: orgId, keychain: true)]
+                    self.save(cfg)
                 }
             }
         }
+    }
+
+    /// A name already on screen or in the config — two rows under one name would share
+    /// their state.
+    private func isTaken(_ name: String) -> Bool {
+        sourceNames.contains(name) || config.configuredNames.contains(name)
+    }
+
+    /// Checks the token against the usage endpoint before saving it, so a token that cannot
+    /// read limits is turned away here instead of becoming an error row.
+    private func addOAuthAccount(name: String, token: String) {
+        checkToken(token) { [weak self] in
+            guard let self else { return }
+            guard name.isEmpty else { return self.saveOAuthAccount(name: name, token: token) }
+            fetchOAuthLabel(token: token) { email in
+                DispatchQueue.main.async {
+                    guard let email else { return self.showError(T.tokenNeedsName) }
+                    self.saveOAuthAccount(name: email, token: token)
+                }
+            }
+        }
+    }
+
+    /// Runs `then` on the main thread only if the token can read usage limits; otherwise
+    /// says why it cannot.
+    private func checkToken(_ token: String, then: @escaping () -> Void) {
+        fetchUsageOAuth(token: token) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .failure(let err):
+                    if case .auth(let code)? = err as? ClaudeError {
+                        return self.showError(String(format: T.tokenRejected, code))
+                    }
+                    self.showError(err.localizedDescription)
+                case .success(let usage):
+                    guard makeReading(usage) != nil else { return self.showError(T.shapeError) }
+                    then()
+                }
+            }
+        }
+    }
+
+    private func saveOAuthAccount(name: String, token: String) {
+        guard !isTaken(name) else { return showError(String(format: T.accountExists, name)) }
+        let status = storeAddedKey(token, account: keyAccount(.token, name))
+        guard status == errSecSuccess else {
+            return showError(String(format: T.keychainFailed, Int(status)))
+        }
+        var cfg = loadConfig()
+        cfg.oauth_accounts = cfg.oauthAccountList + [OAuthAccount(name: name, token: "", keychain: true)]
+        save(cfg)
+    }
+
+    private func save(_ cfg: Config) {
+        do {
+            try saveConfig(cfg)
+            config = cfg
+            startTimers()
+            poll()
+        } catch {
+            showError(String(format: T.saveFailed, error.localizedDescription))
+        }
+    }
+
+    // MARK: Accounts window
+
+    @objc private func manageAccounts() {
+        if accountsWindow == nil {
+            accountsWindow = AccountsWindowController(
+                rows: { [weak self] in self?.accountRows() ?? [] },
+                onAdd: { [weak self] in self?.addAccount() },
+                onReplaceKey: { [weak self] in self?.replaceKey(for: $0) },
+                onRemove: { [weak self] in self?.removeAccount(named: $0.name) })
+        }
+        accountsWindow?.show()
+    }
+
+    private func accountRows() -> [AccountRow] {
+        claudeCodeNames.map { AccountRow(name: $0, kind: .claudeCode, inKeychain: true, status: statusText($0)) }
+            + config.accountList.filter(\.isFilledIn).map {
+                AccountRow(name: $0.name, kind: .sessionKey, inKeychain: $0.inKeychain, status: statusText($0.name))
+            }
+            + config.oauthAccountList.filter(\.isFilledIn).map {
+                AccountRow(name: $0.name, kind: .token, inKeychain: $0.inKeychain, status: statusText($0.name))
+            }
+    }
+
+    private func statusText(_ name: String) -> String {
+        guard let r = readings[name] else { return T.loading }
+        if let err = r.error { return err }
+        func figure(_ w: Window?) -> String { w.map { pct($0.pct) } ?? "—" }
+        return String(format: T.statusLine, figure(r.fiveHour), figure(r.sevenDay))
+    }
+
+    /// Asks for a new key, checks it the same way adding an account does, and only then
+    /// replaces the old one in the Keychain.
+    private func replaceKey(for row: AccountRow) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = String(format: T.replaceKeyTitle, row.name)
+        alert.informativeText = T.replaceKeyHint
+        alert.addButton(withTitle: T.saveButton)
+        alert.addButton(withTitle: T.cancelButton)
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = row.kind == .token ? "sk-ant-oat…" : "sk-ant-sid…"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return showError(T.keyRequired) }
+        guard isOAuthToken(key) == (row.kind == .token) else {
+            return showError(String(format: T.wrongKeyKind, row.typeText))
+        }
+        if row.kind == .token {
+            checkToken(key) { [weak self] in self?.commitKey(key, for: row, orgId: nil) }
+            return
+        }
+        discoverOrgId(sessionKey: key) { [weak self] result in
+            DispatchQueue.main.async {
+                switch result {
+                case .failure(let err): self?.showError(err.localizedDescription)
+                case .success(let orgId): self?.commitKey(key, for: row, orgId: orgId)
+                }
+            }
+        }
+    }
+
+    private func commitKey(_ key: String, for row: AccountRow, orgId: String?) {
+        let kind: KeyKind = row.kind == .token ? .token : .sessionKey
+        let status = storeAddedKey(key, account: keyAccount(kind, row.name))
+        guard status == errSecSuccess else { return showError(String(format: T.keychainFailed, Int(status))) }
+        var cfg = loadConfig()
+        if kind == .token {
+            cfg.oauth_accounts = cfg.oauthAccountList.map {
+                $0.name == row.name ? OAuthAccount(name: $0.name, token: "", keychain: true) : $0
+            }
+        } else {
+            cfg.accounts = cfg.accountList.map {
+                $0.name == row.name
+                    ? Account(name: $0.name, session_key: "", org_id: orgId ?? $0.org_id, keychain: true) : $0
+            }
+        }
+        // The new key may belong to a different account, so the old baseline cannot be
+        // trusted to tell a reset from a switch.
+        baselines.removeValue(forKey: row.name)
+        fastPolled.removeValue(forKey: row.name)
+        save(cfg)
+    }
+
+    private func removeAccount(named name: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = String(format: T.removeTitle, name)
+        alert.informativeText = T.removeHint
+        alert.addButton(withTitle: T.removeButton)
+        alert.addButton(withTitle: T.cancelButton)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        var cfg = loadConfig()
+        cfg.accounts = cfg.accountList.filter { $0.name != name }
+        let tokens = cfg.oauthAccountList.filter { $0.name != name }
+        cfg.oauth_accounts = tokens.isEmpty ? nil : tokens
+        deleteAddedKey(account: keyAccount(.sessionKey, name))
+        deleteAddedKey(account: keyAccount(.token, name))
+        // Forgotten outright — a removed account should not linger as a snapshot.
+        readings.removeValue(forKey: name)
+        baselines.removeValue(forKey: name)
+        fastPolled.removeValue(forKey: name)
+        staleAccounts.removeValue(forKey: name)
+        save(cfg)
     }
 
     private func showError(_ text: String) {
@@ -867,6 +1297,12 @@ func runSelfCheck() {
         assert(!l.resetTitle.isEmpty && !l.resetBody.isEmpty, "message templates: \(code)")
         assert(l.days.count == 7 && !l.days.contains(where: \.isEmpty), "weekday names: \(code)")
         assert(!l.lastSeen.isEmpty && !l.loading.isEmpty && !l.idleLine.isEmpty, "status strings: \(code)")
+        assert(!l.manageAccounts.isEmpty && !l.removeTitle.isEmpty && !l.removeButton.isEmpty
+               && l.statusLine.components(separatedBy: "%@").count == 3
+               && l.replaceKeyTitle.contains("%@") && l.wrongKeyKind.contains("%@")
+               && !l.colStorage.isEmpty && !l.storageKeychain.isEmpty && !l.keyRequired.isEmpty && !l.nameRequired.isEmpty
+               && !l.tokenNeedsName.isEmpty && l.tokenRejected.contains("%d")
+               && !l.keyMissing.isEmpty && l.keychainFailed.contains("%d"), "account strings: \(code)")
     }
 
     // A partial config must survive decoding — a fresh install writes nothing but the
@@ -967,6 +1403,54 @@ func runSelfCheck() {
     assert(windowLine(T.fiveHourLine, tag: "5h", nil).contains("5h"), "the idle line names its window")
     assert(makeReading(empty) == nil, "nothing readable anywhere still fails")
     assert(makeReading(scoped)?.headline?.pct == 9, "a running 5-hour window drives the menu bar")
+
+    // Several Claude Code logins: expired ones are dropped, the rest come freshest first,
+    // and a token stored twice (Keychain and file) is polled once.
+    let nowMs = now.timeIntervalSince1970 * 1000
+    let creds = [StoredCredential(token: "old", expiresAt: nowMs - 1000),
+                 StoredCredential(token: "b", expiresAt: nowMs + 1000),
+                 StoredCredential(token: "a", expiresAt: nowMs + 9000),
+                 StoredCredential(token: "b", expiresAt: nowMs + 1000)]
+    assert(liveTokens(creds, now: now) == ["a", "b"], "live tokens, freshest first, each once")
+    assert(liveTokens([StoredCredential(token: "x", expiresAt: 0)], now: now) == ["x"],
+           "a token without an expiry is kept")
+    assert(liveTokens([StoredCredential(token: "old", expiresAt: nowMs - 1000),
+                       StoredCredential(token: "older", expiresAt: nowMs - 9000)], now: now) == ["old"],
+           "with every token expired the freshest stays, so the row can say why")
+    assert(liveTokens([], now: now).isEmpty)
+
+    let named = nameClaudeCodeLogins(tokens: ["t1", "t2", "t3", "t4"],
+                                     emails: ["a@x", nil, "a@x", "cfg@x"],
+                                     known: ["t2": "b@x"], previous: [], configured: ["cfg@x"])
+    assert(named.map(\.name) == ["a@x", "b@x"],
+           "emails name logins, a known token keeps its name, duplicates and configured names are skipped")
+    assert(nameClaudeCodeLogins(tokens: ["new"], emails: [nil], known: [:], previous: ["me@x"],
+                                configured: [])[0].name == "me@x",
+           "a single login whose email is unavailable keeps the previous name")
+    assert(nameClaudeCodeLogins(tokens: ["t1", "t2"], emails: [nil, nil], known: [:], previous: [],
+                                configured: []).map(\.name) == ["Claude Code", "Claude Code 2"],
+           "unnamed logins get distinct names")
+
+    // A hand-written account may leave out org_id; it decodes empty instead of costing the
+    // whole file. OAuth accounts sit in their own key.
+    let multiJSON = #"{"accounts":[{"name":"s","session_key":"sk-ant-sid1"}],"oauth_accounts":[{"name":"t","token":"sk-ant-oat1"}]}"#
+    let multi = try! JSONDecoder().decode(Config.self, from: multiJSON.data(using: .utf8)!)
+    assert(multi.accountList.first?.org_id == "", "a missing org_id decodes empty")
+    assert(multi.configuredNames == ["s", "t"], "both kinds of account are listed, in order")
+    assert(isOAuthToken("sk-ant-oat01-abc") && !isOAuthToken("sk-ant-sid01-abc"))
+    let skeletonJSON = #"{"accounts":[{"name":"","session_key":"","org_id":""}]}"#
+    let skeleton = try! JSONDecoder().decode(Config.self, from: skeletonJSON.data(using: .utf8)!)
+    assert(skeleton.configuredNames.isEmpty, "an unfilled skeleton entry is not an account")
+
+    // An account whose key moved to the Keychain has an empty key in the file and is still
+    // an account; the marker survives a round trip through the encoder.
+    let kcJSON = #"{"accounts":[{"name":"s","session_key":"","org_id":"o","keychain":true}],"oauth_accounts":[{"name":"t","token":"","keychain":true}]}"#
+    let kc = try! JSONDecoder().decode(Config.self, from: kcJSON.data(using: .utf8)!)
+    assert(kc.configuredNames == ["s", "t"], "Keychain-backed entries count as accounts")
+    let kcBack = try! JSONDecoder().decode(Config.self, from: JSONEncoder().encode(kc))
+    assert(kcBack.accountList.first?.inKeychain == true && kcBack.oauthAccountList.first?.inKeychain == true,
+           "the Keychain marker is written back")
+    assert(keyAccount(.sessionKey, "a") != keyAccount(.token, "a"), "the two kinds never share an item")
 
     // The gauge must always occupy the same width, or the rows stop lining up.
     for v in [-5.0, 0, 0.4, 12.5, 50, 99.9, 100, 150] {

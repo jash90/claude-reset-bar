@@ -36,6 +36,7 @@ type strings18n struct {
 	networkError string
 	badShape     string
 	badTimestamp string
+	keychainOnly string
 	notifyWorks  string
 	tooltipIdle  string
 }
@@ -68,6 +69,7 @@ var languages = map[string]strings18n{
 			"the token, or enter a new sessionKey",
 		networkError: "network error: %w",
 		badShape:     "unexpected response shape: %w",
+		keychainOnly: "The key is in the macOS Keychain — only the macOS app reads it.",
 		badTimestamp: "unreadable resets_at timestamp",
 		notifyWorks:  "Notifications are working.",
 		tooltipIdle:  "ClaudeResetBar",
@@ -99,6 +101,7 @@ var languages = map[string]strings18n{
 			"token, albo wpisz nowy sessionKey",
 		networkError: "błąd sieci: %w",
 		badShape:     "nieoczekiwany kształt odpowiedzi: %w",
+		keychainOnly: "Klucz jest w pęku kluczy macOS — odczyta go tylko aplikacja na macOS.",
 		badTimestamp: "nieczytelny znacznik resets_at",
 		notifyWorks:  "Powiadomienia działają.",
 		tooltipIdle:  "ClaudeResetBar",
