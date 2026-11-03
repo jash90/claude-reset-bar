@@ -66,12 +66,16 @@ struct UsageResponse: Codable {
     let limits: [UsageLimit]?
 }
 
+/// One limit window: how much of it is used and when it starts over.
+typealias Window = (pct: Double, resetsAt: Date)
+
 /// The latest reading for one account — this is what the menu draws.
 struct Reading {
-    var fiveHourPct: Double
-    var sevenDayPct: Double
-    var fiveHourResetsAt: Date
-    var sevenDayResetsAt: Date
+    /// nil when the API reports no such window. A 5-hour window only exists while one is
+    /// running, and since 2026-11 the API answers an idle one with `"five_hour": null` and
+    /// no session entry in `limits` at all, so its absence is a normal state, not an error.
+    var fiveHour: Window?
+    var sevenDay: Window?
     var models: [ModelWindow] = []
     var active: Bool
     var error: String?
@@ -79,6 +83,21 @@ struct Reading {
     /// was signed into a different one — and the row becomes a read-only snapshot of the
     /// final reading.
     var lastSeen: Date?
+
+    /// The window that limits you right now: the 5-hour one while it runs, otherwise the
+    /// weekly one. This is what the menu bar figure shows.
+    var headline: Window? { fiveHour ?? sevenDay }
+}
+
+/// Turns a usage response into a reading. Each window is optional; the account only counts
+/// as unreadable when neither the 5-hour nor the 7-day window can be found anywhere.
+func makeReading(_ usage: UsageResponse) -> Reading? {
+    let five = windowReading(usage.five_hour, usage.limits, kind: "session")
+    let seven = windowReading(usage.seven_day, usage.limits, kind: "weekly_all")
+    guard five != nil || seven != nil else { return nil }
+    let session = usage.limits?.first { $0.group == "session" || $0.kind == "session" }
+    return Reading(fiveHour: five, sevenDay: seven, models: modelWindows(usage),
+                   active: session?.is_active ?? false, error: nil, lastSeen: nil)
 }
 
 // MARK: - Reset detection (pure logic, no I/O)
@@ -205,7 +224,7 @@ func modelWindows(_ usage: UsageResponse) -> [ModelWindow] {
 /// under `limits` — so neither is treated as the one that must be there. A row is only lost
 /// when both come back empty.
 func windowReading(_ dedicated: UsageWindow?, _ limits: [UsageLimit]?,
-                   kind: String) -> (pct: Double, resetsAt: Date)? {
+                   kind: String) -> Window? {
     let entry = limits?.first { $0.kind == kind }
     guard let pct = dedicated?.utilization ?? entry?.percent,
           let stamp = dedicated?.resets_at ?? entry?.resets_at,
@@ -426,6 +445,12 @@ func bar(_ percent: Double) -> String {
 /// A system notification. ponytail: osascript rather than UNUserNotificationCenter — it needs
 /// neither a signed bundle nor an authorization dialog. If the banner should carry its own
 /// icon instead of Script Editor's, that is the moment to switch.
+/// One window's menu line, or the "no active window" line when the API reported none.
+func windowLine(_ format: String, tag: String, _ w: Window?) -> String {
+    guard let w else { return String(format: T.idleLine, tag, bar(0)) }
+    return String(format: format, bar(w.pct), paddedPct(w.pct), remaining(until: w.resetsAt), clock(w.resetsAt))
+}
+
 func notify(title: String, message: String) {
     func esc(_ s: String) -> String { s.replacingOccurrences(of: "\"", with: "'") }
     let script = "display notification \"\(esc(message))\" with title \"\(esc(title))\" sound name \"Glass\""
@@ -491,10 +516,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// stale past date would be polled every minute forever.
     private func fastPollIfResetDue() {
         let now = Date()
-        for (name, reading) in readings where reading.fiveHourResetsAt <= now {
-            guard reading.lastSeen == nil else { continue }
-            guard fastPolled[name] != reading.fiveHourResetsAt else { continue }
-            fastPolled[name] = reading.fiveHourResetsAt
+        for (name, reading) in readings {
+            guard reading.lastSeen == nil, reading.error == nil,
+                  let due = reading.headline?.resetsAt, due <= now else { continue }
+            guard fastPolled[name] != due else { continue }
+            fastPolled[name] = due
             poll()
             return
         }
@@ -577,27 +603,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             note(error: err.localizedDescription, for: name)
 
         case .success(let usage):
-            guard let five = windowReading(usage.five_hour, usage.limits, kind: "session"),
-                  let seven = windowReading(usage.seven_day, usage.limits, kind: "weekly_all")
-            else {
+            guard let reading = makeReading(usage) else {
                 note(error: ClaudeError.shape.localizedDescription, for: name)
                 break
             }
-            let session = usage.limits?.first { $0.group == "session" || $0.kind == "session" }
-            readings[name] = Reading(
-                fiveHourPct: five.pct,
-                sevenDayPct: seven.pct,
-                fiveHourResetsAt: five.resetsAt,
-                sevenDayResetsAt: seven.resetsAt,
-                models: modelWindows(usage),
-                active: session?.is_active ?? false,
-                error: nil,
-                lastSeen: nil)
+            readings[name] = reading
 
-            check(name: name, window: "five_hour", label: T.fiveHourWindow,
-                  resetsAt: five.resetsAt, utilization: five.pct)
-            check(name: name, window: "seven_day", label: T.sevenDayWindow,
-                  resetsAt: seven.resetsAt, utilization: seven.pct)
+            if let five = reading.fiveHour {
+                check(name: name, window: "five_hour", label: T.fiveHourWindow,
+                      resetsAt: five.resetsAt, utilization: five.pct)
+            }
+            if let seven = reading.sevenDay {
+                check(name: name, window: "seven_day", label: T.sevenDayWindow,
+                      resetsAt: seven.resetsAt, utilization: seven.pct)
+            }
         }
         updateTitle()
         rebuildMenu()
@@ -606,9 +625,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Marks the row as failed while keeping whatever it already showed, so a hiccup turns
     /// a live account into a labelled error rather than into nothing at all.
     private func note(error: String, for name: String) {
-        var r = readings[name] ?? Reading(fiveHourPct: 0, sevenDayPct: 0,
-                                          fiveHourResetsAt: .distantFuture,
-                                          sevenDayResetsAt: .distantFuture,
+        var r = readings[name] ?? Reading(fiveHour: nil, sevenDay: nil,
                                           models: [], active: false, error: nil, lastSeen: nil)
         r.error = error
         readings[name] = r
@@ -634,14 +651,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let live = readings.values.filter { $0.error == nil && $0.lastSeen == nil }
-        guard let worst = live.max(by: { $0.fiveHourPct < $1.fiveHourPct }) else {
+        guard let worst = live.compactMap(\.headline).max(by: { $0.pct < $1.pct }) else {
             statusItem.button?.title = "Claude ⚠︎"
             return
         }
         // Once a window is exhausted the only thing that matters is when it returns.
-        statusItem.button?.title = worst.fiveHourPct >= 100
-            ? "Claude \(pct(worst.fiveHourPct)) · \(remaining(until: worst.fiveHourResetsAt))"
-            : "Claude \(pct(worst.fiveHourPct))"
+        statusItem.button?.title = worst.pct >= 100
+            ? "Claude \(pct(worst.pct)) · \(remaining(until: worst.resetsAt))"
+            : "Claude \(pct(worst.pct))"
     }
 
     private func rebuildMenu() {
@@ -671,14 +688,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let seen = r.lastSeen {
                 label += String(format: T.lastSeen, clockFormatter.string(from: seen))
             }
-            var lines = ["\(r.active && r.lastSeen == nil ? "●" : "○") \(label)",
-                         String(format: T.fiveHourLine, bar(r.fiveHourPct), paddedPct(r.fiveHourPct),
-                                remaining(until: r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
-                         String(format: T.sevenDayLine, bar(r.sevenDayPct), paddedPct(r.sevenDayPct),
-                                remaining(until: r.sevenDayResetsAt), clock(r.sevenDayResetsAt))]
-            for m in r.models {
-                lines.append(String(format: T.modelLine, bar(m.pct), paddedPct(m.pct), m.label))
-            }
+            let lines = ["\(r.active && r.lastSeen == nil ? "●" : "○") \(label)",
+                         windowLine(T.fiveHourLine, tag: "5h", r.fiveHour),
+                         windowLine(T.sevenDayLine, tag: "7d", r.sevenDay)]
+                + r.models.map { String(format: T.modelLine, bar($0.pct), paddedPct($0.pct), $0.label) }
             for line in lines { menu.addItem(disabled(line)) }
         }
 
@@ -853,7 +866,7 @@ func runSelfCheck() {
         assert(!l.refreshNow.isEmpty && !l.quit.isEmpty && !l.language.isEmpty, "menu strings: \(code)")
         assert(!l.resetTitle.isEmpty && !l.resetBody.isEmpty, "message templates: \(code)")
         assert(l.days.count == 7 && !l.days.contains(where: \.isEmpty), "weekday names: \(code)")
-        assert(!l.lastSeen.isEmpty && !l.loading.isEmpty, "status strings: \(code)")
+        assert(!l.lastSeen.isEmpty && !l.loading.isEmpty && !l.idleLine.isEmpty, "status strings: \(code)")
     }
 
     // A partial config must survive decoding — a fresh install writes nothing but the
@@ -930,6 +943,30 @@ func runSelfCheck() {
     let empty = try! JSONDecoder().decode(UsageResponse.self, from: emptyJSON.data(using: .utf8)!)
     assert(windowReading(empty.five_hour, empty.limits, kind: "session") == nil,
            "an empty response reports failure, it does not invent a reading")
+
+    // The shape the API sends since 2026-11 while no 5-hour window is running: five_hour
+    // is null and limits[] has no session entry at all. The account stays readable, with
+    // the weekly window on show and the 5-hour one marked idle — this used to fail the
+    // whole Keychain account with "unexpected response shape".
+    let idleJSON = """
+    {"five_hour":null,
+     "seven_day":{"utilization":58.0,"resets_at":"2026-11-08T00:59:59.858545+00:00"},
+     "limits":[{"kind":"weekly_all","group":"weekly","percent":58,
+                "resets_at":"2026-11-08T00:59:59.858545+00:00","is_active":true},
+               {"kind":"weekly_scoped","group":"weekly","percent":0,
+                "resets_at":"2026-11-08T01:00:00+00:00",
+                "scope":{"model":{"display_name":"Fable"}},"is_active":false}]}
+    """
+    let idle = try! JSONDecoder().decode(UsageResponse.self, from: idleJSON.data(using: .utf8)!)
+    let idleReading = makeReading(idle)
+    assert(idleReading != nil, "a missing 5-hour window does not fail the account")
+    assert(idleReading?.fiveHour == nil, "an idle 5-hour window is reported as absent, not as 0%")
+    assert(idleReading?.sevenDay?.pct == 58, "the weekly window still comes through")
+    assert(idleReading?.headline?.pct == 58, "the menu bar falls back to the weekly figure")
+    assert(idleReading?.models.first?.label == "Fable", "per-model caps still come through")
+    assert(windowLine(T.fiveHourLine, tag: "5h", nil).contains("5h"), "the idle line names its window")
+    assert(makeReading(empty) == nil, "nothing readable anywhere still fails")
+    assert(makeReading(scoped)?.headline?.pct == 9, "a running 5-hour window drives the menu bar")
 
     // The gauge must always occupy the same width, or the rows stop lining up.
     for v in [-5.0, 0, 0.4, 12.5, 50, 99.9, 100, 150] {

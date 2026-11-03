@@ -85,19 +85,35 @@ type Config struct {
 	Language             string    `json:"language,omitempty"`
 }
 
+// window is one limit window: how much of it is used and when it starts over.
+type window struct {
+	pct      float64
+	resetsAt time.Time
+}
+
 type reading struct {
-	name             string
-	fiveHourPct      float64
-	sevenDayPct      float64
-	fiveHourResetsAt time.Time
-	sevenDayResetsAt time.Time
-	models           []modelWindow
-	active           bool
-	err              string
+	name string
+	// nil when the API reports no such window. A 5-hour window only exists while one is
+	// running, and since 2026-11 the API answers an idle one with "five_hour": null and no
+	// session entry in limits[] at all, so its absence is a normal state, not an error.
+	fiveHour *window
+	sevenDay *window
+	models   []modelWindow
+	active   bool
+	err      string
 	// lastSeen is zero for a live account. It is set when the account can no longer be
 	// polled — Claude Code was signed into a different one — and the row becomes a
 	// read-only snapshot of the final reading.
 	lastSeen time.Time
+}
+
+// headline is the window that limits you right now: the 5-hour one while it runs,
+// otherwise the weekly one. This is what the menu bar figure shows.
+func (r reading) headline() *window {
+	if r.fiveHour != nil {
+		return r.fiveHour
+	}
+	return r.sevenDay
 }
 
 // ─── Reset detection (pure logic, no I/O) ─────────────────────────────────────
@@ -628,7 +644,7 @@ func parseISO(s string) (time.Time, bool) {
 // has already retired one of those shapes once — the per-model caps went null in their own
 // fields and turned up under limits[] — so neither is treated as the one that must be
 // there. A window is only lost when both come back empty.
-func windowReading(w *UsageWindow, limits []UsageLimit, kind string) (float64, time.Time, bool) {
+func windowReading(w *UsageWindow, limits []UsageLimit, kind string) *window {
 	var pct *float64
 	var stamp *string
 	if w != nil {
@@ -647,30 +663,28 @@ func windowReading(w *UsageWindow, limits []UsageLimit, kind string) (float64, t
 		break
 	}
 	if pct == nil || stamp == nil {
-		return 0, time.Time{}, false
+		return nil
 	}
 	t, ok := parseISO(*stamp)
 	if !ok {
-		return 0, time.Time{}, false
+		return nil
 	}
-	return *pct, t, true
+	return &window{pct: *pct, resetsAt: t}
 }
 
 func toReading(name string, u UsageResponse, err error) reading {
 	if err != nil {
 		return reading{name: name, err: err.Error()}
 	}
-	fivePct, five, ok1 := windowReading(u.FiveHour, u.Limits, "session")
-	sevenPct, seven, ok2 := windowReading(u.SevenDay, u.Limits, "weekly_all")
-	if !ok1 || !ok2 {
-		return reading{name: name, err: T().badTimestamp}
-	}
+	// Each window is optional; the account only counts as unreadable when neither the
+	// 5-hour nor the 7-day window can be found anywhere.
 	r := reading{
-		name:             name,
-		fiveHourPct:      fivePct,
-		sevenDayPct:      sevenPct,
-		fiveHourResetsAt: five,
-		sevenDayResetsAt: seven,
+		name:     name,
+		fiveHour: windowReading(u.FiveHour, u.Limits, "session"),
+		sevenDay: windowReading(u.SevenDay, u.Limits, "weekly_all"),
+	}
+	if r.fiveHour == nil && r.sevenDay == nil {
+		return reading{name: name, err: T().badTimestamp}
 	}
 	// Per-model weekly caps arrive two ways depending on the account. The dedicated
 	// fields are the older shape and now usually null; the scoped entries in limits[] are
@@ -807,8 +821,12 @@ func poll() {
 		if r.err != "" {
 			continue
 		}
-		checkReset(r.name, "five_hour", T().fiveHourWindow, r.fiveHourResetsAt, r.fiveHourPct)
-		checkReset(r.name, "seven_day", T().sevenDayWindow, r.sevenDayResetsAt, r.sevenDayPct)
+		if w := r.fiveHour; w != nil {
+			checkReset(r.name, "five_hour", T().fiveHourWindow, w.resetsAt, w.pct)
+		}
+		if w := r.sevenDay; w != nil {
+			checkReset(r.name, "seven_day", T().sevenDayWindow, w.resetsAt, w.pct)
+		}
 	}
 	mu.Unlock()
 
@@ -823,13 +841,14 @@ func fastPollIfResetDue() {
 	defer mu.Unlock()
 	now := time.Now()
 	for _, r := range readings {
-		if r.err != "" || !r.lastSeen.IsZero() || r.fiveHourResetsAt.After(now) {
+		h := r.headline()
+		if r.err != "" || !r.lastSeen.IsZero() || h == nil || h.resetsAt.After(now) {
 			continue
 		}
-		if done, ok := fastPolled[r.name]; ok && done.Equal(r.fiveHourResetsAt) {
+		if done, ok := fastPolled[r.name]; ok && done.Equal(h.resetsAt) {
 			continue
 		}
-		fastPolled[r.name] = r.fiveHourResetsAt
+		fastPolled[r.name] = h.resetsAt
 		requestPoll()
 		return
 	}
@@ -866,6 +885,15 @@ func applyLanguage() {
 	}
 }
 
+// windowLine is one window's menu line, or the "no active window" line when the API
+// reported none.
+func windowLine(format, tag string, w *window) string {
+	if w == nil {
+		return fmt.Sprintf(T().idleLine, tag, bar(0), "—")
+	}
+	return fmt.Sprintf(format, bar(w.pct), pct(w.pct), remainingUntil(w.resetsAt), clock(w.resetsAt))
+}
+
 func render() {
 	mu.Lock()
 	snapshot := append([]reading(nil), readings...)
@@ -898,17 +926,15 @@ func render() {
 		}
 		lines = append(lines,
 			fmt.Sprintf("%s %s", dot, name),
-			fmt.Sprintf(T().fiveHourLine, bar(r.fiveHourPct), pct(r.fiveHourPct),
-				remainingUntil(r.fiveHourResetsAt), clock(r.fiveHourResetsAt)),
-			fmt.Sprintf(T().sevenDayLine, bar(r.sevenDayPct), pct(r.sevenDayPct),
-				remainingUntil(r.sevenDayResetsAt), clock(r.sevenDayResetsAt)))
+			windowLine(T().fiveHourLine, "5h", r.fiveHour),
+			windowLine(T().sevenDayLine, "7d", r.sevenDay))
 		for _, m := range r.models {
 			lines = append(lines, fmt.Sprintf(T().modelLine, bar(m.pct), pct(m.pct), m.label))
 		}
 		// The menu bar figure describes what you can still use right now, so a snapshot
 		// of an unreachable account must not drive it.
-		if r.lastSeen.IsZero() && r.fiveHourPct > worst {
-			worst, worstReset = r.fiveHourPct, r.fiveHourResetsAt
+		if h := r.headline(); r.lastSeen.IsZero() && h != nil && h.pct > worst {
+			worst, worstReset = h.pct, h.resetsAt
 		}
 	}
 
@@ -1108,7 +1134,7 @@ func runSelfCheck() {
 	for code, l := range languages {
 		assert(l.refreshNow != "" && l.quit != "" && l.language != "" && l.now != "",
 			"language "+code+" defines its menu strings")
-		assert(l.resetTitle != "" && l.resetBody != "" && l.fiveHourLine != "" && l.lastSeen != "",
+		assert(l.resetTitle != "" && l.resetBody != "" && l.fiveHourLine != "" && l.lastSeen != "" && l.idleLine != "",
 			"language "+code+" defines its message templates")
 		assert(strings.Contains(fmt.Sprintf(l.lastSeen, "12:03"), "12:03"),
 			"language "+code+" renders the last-seen stamp")
@@ -1218,9 +1244,31 @@ func runSelfCheck() {
 		},
 	}, nil)
 	assert(nulled.err == "", "null windows fall back to limits[] rather than failing")
-	assert(nulled.fiveHourPct == 9 && nulled.sevenDayPct == 25,
+	assert(nulled.fiveHour != nil && nulled.sevenDay != nil &&
+		nulled.fiveHour.pct == 9 && nulled.sevenDay.pct == 25,
 		"the percentages come from the limits entries")
-	assert(!nulled.fiveHourResetsAt.IsZero(), "the reset time comes along with the percentage")
+	assert(!nulled.fiveHour.resetsAt.IsZero(), "the reset time comes along with the percentage")
+
+	// The shape the API sends since 2026-11 while no 5-hour window is running: five_hour
+	// is null and limits[] has no session entry at all. The account stays readable, with
+	// the weekly window on show and the 5-hour one marked idle — this used to fail the
+	// whole Claude Code account.
+	idle := toReading("acc", UsageResponse{
+		FiveHour: nil,
+		SevenDay: win(58, "2026-11-08T00:59:59.858545+00:00"),
+		Limits: []UsageLimit{
+			{Kind: "weekly_all", Group: "weekly", Percent: ptr(58.0), IsActive: true,
+				ResetsAt: ptr("2026-11-08T00:59:59.858545+00:00")},
+			mustScoped("Fable", 0),
+		},
+	}, nil)
+	assert(idle.err == "", "a missing 5-hour window does not fail the account")
+	assert(idle.fiveHour == nil, "an idle 5-hour window is reported as absent, not as 0%")
+	assert(idle.sevenDay != nil && idle.sevenDay.pct == 58, "the weekly window still comes through")
+	assert(idle.headline() != nil && idle.headline().pct == 58,
+		"the menu bar falls back to the weekly figure")
+	assert(len(idle.models) == 1 && idle.models[0].label == "Fable", "per-model caps still come through")
+	assert(strings.Contains(windowLine(T().fiveHourLine, "5h", nil), "5h"), "the idle line names its window")
 
 	// Nothing to read anywhere is still an error rather than a row of zeros.
 	assert(toReading("acc", UsageResponse{}, nil).err != "",
