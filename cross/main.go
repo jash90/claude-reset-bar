@@ -97,10 +97,13 @@ type Config struct {
 	OAuthAccounts []OAuthAccount `json:"oauth_accounts,omitempty"`
 	// HiddenLogins are emails of Claude Code logins hidden from the menu by the macOS app's
 	// accounts window. Hiding never touches the login itself.
-	HiddenLogins         []string `json:"hidden_logins,omitempty"`
-	CheckIntervalMinutes int      `json:"check_interval_minutes,omitempty"`
-	SlackWebhookURL      string   `json:"slack_webhook_url,omitempty"`
-	Language             string   `json:"language,omitempty"`
+	HiddenLogins []string `json:"hidden_logins,omitempty"`
+	// MenuBarAccount is the account the tray figure follows: empty for the Claude Code
+	// login, mostUsedChoice for the fullest account, or an account's name.
+	MenuBarAccount       string `json:"menu_bar_account,omitempty"`
+	CheckIntervalMinutes int    `json:"check_interval_minutes,omitempty"`
+	SlackWebhookURL      string `json:"slack_webhook_url,omitempty"`
+	Language             string `json:"language,omitempty"`
 }
 
 // window is one limit window: how much of it is used and when it starts over.
@@ -1201,6 +1204,43 @@ func applyLanguage() {
 	}
 }
 
+// mostUsedChoice is the menu_bar_account value that makes the tray follow the fullest account.
+const mostUsedChoice = "*most-used"
+
+// menuBarReading picks the reading the tray figure follows. By default that is the account
+// signed into Claude Code. A chosen account wins while it has a live reading; otherwise, and
+// when no Claude Code login is readable either, the fullest account stands in, so the
+// figure never goes blank while some account can be read.
+func menuBarReading(choice string, claudeCode []string, rs []reading) *reading {
+	live := func(name string) *reading {
+		for i := range rs {
+			r := &rs[i]
+			if r.name == name && r.err == "" && r.lastSeen.IsZero() && r.headline() != nil {
+				return r
+			}
+		}
+		return nil
+	}
+	var mostUsed *reading
+	for i := range rs {
+		if r := live(rs[i].name); r != nil && (mostUsed == nil || r.headline().pct > mostUsed.headline().pct) {
+			mostUsed = r
+		}
+	}
+	if choice == mostUsedChoice {
+		return mostUsed
+	}
+	if r := live(choice); choice != "" && r != nil {
+		return r
+	}
+	for _, name := range claudeCode {
+		if r := live(name); r != nil {
+			return r
+		}
+	}
+	return mostUsed
+}
+
 // windowLine is one window's menu line, or the "no active window" line when the API
 // reported none.
 func windowLine(format, tag string, w *window) string {
@@ -1213,6 +1253,7 @@ func windowLine(format, tag string, w *window) string {
 func render() {
 	mu.Lock()
 	snapshot := append([]reading(nil), readings...)
+	logins := append([]string(nil), claudeCodeNames...)
 	mu.Unlock()
 
 	var lines []string
@@ -1247,11 +1288,11 @@ func render() {
 		for _, m := range r.models {
 			lines = append(lines, fmt.Sprintf(T().modelLine, bar(m.pct), pct(m.pct), m.label))
 		}
-		// The menu bar figure describes what you can still use right now, so a snapshot
-		// of an unreachable account must not drive it.
-		if h := r.headline(); r.lastSeen.IsZero() && h != nil && h.pct > worst {
-			worst, worstReset = h.pct, h.resetsAt
-		}
+	}
+	// The tray figure follows the Claude Code login unless the config picks another account.
+	// A snapshot of an unreachable account never drives it.
+	if r := menuBarReading(loadConfig().MenuBarAccount, logins, snapshot); r != nil {
+		worst, worstReset = r.headline().pct, r.headline().resetsAt
 	}
 
 	for i, item := range infoItems {
@@ -1648,6 +1689,19 @@ func runSelfCheck() {
 		"the fraction becomes a percentage")
 	assert(hr.sevenDay.resetsAt.Equal(time.Unix(1794092400, 0)), "the reset time is carried")
 	assert(hr.fiveHour == nil, "no 5-hour header, no 5-hour window")
+	// The tray follows the Claude Code login by default, a chosen account while it is
+	// readable, and the fullest account when asked to or when nothing else can be read.
+	mk := func(name string, p float64) reading { return reading{name: name, sevenDay: &window{pct: p}} }
+	rs := []reading{mk("cc@x", 59), mk("tok", 100), mk("low", 16), {name: "bad", err: "x"},
+		{name: "old", sevenDay: &window{pct: 95}, lastSeen: time.Now()}}
+	cc := []string{"cc@x"}
+	assert(menuBarReading("", cc, rs).headline().pct == 59, "the Claude Code login by default")
+	assert(menuBarReading(mostUsedChoice, cc, rs).headline().pct == 100, "the fullest live account when asked for")
+	assert(menuBarReading("low", cc, rs).headline().pct == 16, "a chosen account")
+	assert(menuBarReading("bad", cc, rs).headline().pct == 59, "a chosen account without a reading falls back")
+	assert(menuBarReading("", nil, rs).headline().pct == 100, "no Claude Code login: the fullest account stands in")
+	assert(menuBarReading("", nil, rs[3:4]) == nil, "nothing readable")
+
 	spent := reading{fiveHour: &window{pct: 0}, sevenDay: &window{pct: 100}}
 	assert(spent.headline().pct == 100, "a spent weekly limit is not hidden behind an empty 5-hour window")
 	_, hok = usageFromHeaders(http.Header{"Content-Type": {"application/json"}})

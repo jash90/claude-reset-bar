@@ -68,6 +68,9 @@ struct UIStrings {
     let showLogin: String
     let checking: String
     let editHint: String
+    let menuBarShows: String
+    let menuBarDefault: String
+    let menuBarMostUsed: String
     let msgAdded: String        // "Added %@."
     let msgKeyReplaced: String  // "New key saved for %@."
     let msgRemoved: String      // "Removed %@."
@@ -148,6 +151,9 @@ let languages: [String: UIStrings] = [
         showLogin: "Show",
         checking: "Checking the key…",
         editHint: "Double-click a name or a key to edit it. Press Return to save.",
+        menuBarShows: "Menu bar shows",
+        menuBarDefault: "Claude Code account (default)",
+        menuBarMostUsed: "Most used account",
         msgAdded: "Added %@.",
         msgKeyReplaced: "New key saved for %@.",
         msgRemoved: "Removed %@.",
@@ -225,6 +231,9 @@ let languages: [String: UIStrings] = [
         showLogin: "Pokaż",
         checking: "Sprawdzam klucz…",
         editHint: "Kliknij dwukrotnie nazwę lub klucz, aby je edytować. Return zapisuje.",
+        menuBarShows: "W pasku menu",
+        menuBarDefault: "Konto Claude Code (domyślnie)",
+        menuBarMostUsed: "Najbardziej wykorzystane konto",
         msgAdded: "Dodano %@.",
         msgKeyReplaced: "Zapisano nowy klucz dla %@.",
         msgRemoved: "Usunięto %@.",
@@ -255,13 +264,17 @@ func resolveLanguage(configured: String?) -> String {
 /// Writes the chosen language back to the config file. It round-trips through a dictionary
 /// so keys this program does not model — anything the claude-reset CLI keeps there — survive
 /// the write untouched.
-func saveLanguage(_ code: String) throws {
+func saveLanguage(_ code: String) throws { try saveConfigField("language", code) }
+
+/// Sets one top-level key of the config file, leaving every other key as it was. nil
+/// removes the key.
+func saveConfigField(_ key: String, _ value: Any?) throws {
     var doc: [String: Any] = [:]
     if let data = try? Data(contentsOf: configURL),
        let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         doc = parsed
     }
-    doc["language"] = code
+    doc[key] = value
 
     try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
     let out = try JSONSerialization.data(withJSONObject: doc, options: [.prettyPrinted, .sortedKeys])
