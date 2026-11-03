@@ -144,6 +144,9 @@ struct Config: Codable {
     var oauth_accounts: [OAuthAccount]?
     /// Emails of Claude Code logins hidden from the menu. Hiding never touches the login.
     var hidden_logins: [String]?
+    /// Which account the menu bar figure follows: absent for the Claude Code login,
+    /// `mostUsedChoice` for the fullest account, or an account's name.
+    var menu_bar_account: String?
     var check_interval_minutes: Int?
     var slack_webhook_url: String?   // unused here, kept for claude-reset compatibility
     var language: String?
@@ -222,6 +225,25 @@ struct Reading {
         guard let seven = sevenDay else { return five }
         return seven.pct > five.pct ? seven : five
     }
+}
+
+/// The `menu_bar_account` value that makes the menu bar follow the fullest account.
+let mostUsedChoice = "*most-used"
+
+/// The reading the menu bar figure follows. By default that is the account signed into
+/// Claude Code. A chosen account wins while it has a live reading; otherwise, and when no
+/// Claude Code login is readable either, the fullest account stands in, so the figure
+/// never goes blank while some account can be read.
+func menuBarReading(choice: String?, claudeCode: [String], all: [String],
+                    readings: [String: Reading]) -> Reading? {
+    func live(_ name: String) -> Reading? {
+        guard let r = readings[name], r.error == nil, r.lastSeen == nil, r.headline != nil else { return nil }
+        return r
+    }
+    let mostUsed = all.compactMap(live).max { ($0.headline?.pct ?? 0) < ($1.headline?.pct ?? 0) }
+    if choice == mostUsedChoice { return mostUsed }
+    if let choice, let r = live(choice) { return r }
+    return claudeCode.lazy.compactMap(live).first ?? mostUsed
 }
 
 /// Turns a usage response into a reading. Each window is optional; the account only counts
@@ -1028,8 +1050,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.title = "Claude ⚙︎"
             return
         }
-        let live = sourceNames.compactMap { readings[$0] }.filter { $0.error == nil && $0.lastSeen == nil }
-        guard let worst = live.compactMap(\.headline).max(by: { $0.pct < $1.pct }) else {
+        guard let worst = menuBarReading(choice: config.menu_bar_account, claudeCode: claudeCodeNames,
+                                         all: sourceNames, readings: readings)?.headline else {
             statusItem.button?.title = "Claude ⚠︎"
             return
         }
@@ -1079,6 +1101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(action(T.addAccount, #selector(addAccountFromMenu)))
         menu.addItem(action(T.manageAccounts, #selector(manageAccounts)))
         menu.addItem(action(T.openConfig, #selector(openConfig)))
+        menu.addItem(menuBarChoiceItem())
         menu.addItem(languageMenuItem())
         menu.addItem(.separator())
         menu.addItem(action(T.quit, #selector(NSApplication.terminate(_:)), target: NSApp))
@@ -1096,6 +1119,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         parent.submenu = submenu
         return parent
+    }
+
+    /// Which account the menu bar figure follows. Only live accounts are offered; a chosen
+    /// account that disappears falls back to the default without losing the setting.
+    private func menuBarChoiceItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: T.menuBarShows, action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let current = config.menu_bar_account
+        func item(_ title: String, _ choice: String?) -> NSMenuItem {
+            let i = NSMenuItem(title: title, action: #selector(pickMenuBarAccount(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = choice
+            i.state = choice == current ? .on : .off
+            return i
+        }
+        submenu.addItem(item(T.menuBarDefault, nil))
+        submenu.addItem(item(T.menuBarMostUsed, mostUsedChoice))
+        let named = sourceNames.filter { readings[$0]?.lastSeen == nil }
+        if !named.isEmpty { submenu.addItem(.separator()) }
+        for name in named { submenu.addItem(item(name, name)) }
+        parent.submenu = submenu
+        return parent
+    }
+
+    @objc private func pickMenuBarAccount(_ sender: NSMenuItem) {
+        let choice = sender.representedObject as? String
+        do {
+            try saveConfigField("menu_bar_account", choice)
+        } catch {
+            return showError(String(format: T.saveFailed, error.localizedDescription))
+        }
+        config = loadConfig()
+        updateTitle()
+        rebuildMenu()
     }
 
     private func disabled(_ title: String) -> NSMenuItem {
@@ -1629,6 +1686,25 @@ func runSelfCheck() {
     assert(usageFromHeaders(["anthropic-ratelimit-unified-5h-utilization": "0.5",
                              "anthropic-ratelimit-unified-5h-reset": "1794000000"])?.five_hour?.utilization == 50)
     assert(usageFromHeaders(["content-type": "application/json"]) == nil, "no limit headers, no reading")
+
+    // The menu bar follows the Claude Code login by default, a chosen account while it is
+    // readable, and the fullest account when asked to or when nothing else can be read.
+    func r(_ p: Double) -> Reading { Reading(fiveHour: nil, sevenDay: (p, now), active: false) }
+    var errored = r(90); errored.error = "x"
+    var snapshot = r(95); snapshot.lastSeen = now
+    let rs = ["cc@x": r(59), "tok": r(100), "low": r(16), "bad": errored, "old": snapshot]
+    let all = ["cc@x", "tok", "low", "bad", "old"]
+    assert(menuBarReading(choice: nil, claudeCode: ["cc@x"], all: all, readings: rs)?.headline?.pct == 59,
+           "the Claude Code login by default")
+    assert(menuBarReading(choice: mostUsedChoice, claudeCode: ["cc@x"], all: all, readings: rs)?.headline?.pct == 100,
+           "the fullest live account when asked for")
+    assert(menuBarReading(choice: "low", claudeCode: ["cc@x"], all: all, readings: rs)?.headline?.pct == 16,
+           "a chosen account")
+    assert(menuBarReading(choice: "bad", claudeCode: ["cc@x"], all: all, readings: rs)?.headline?.pct == 59,
+           "a chosen account without a reading falls back to the default")
+    assert(menuBarReading(choice: nil, claudeCode: [], all: all, readings: rs)?.headline?.pct == 100,
+           "no Claude Code login: the fullest account stands in")
+    assert(menuBarReading(choice: nil, claudeCode: [], all: ["bad"], readings: rs) == nil, "nothing readable")
 
     // Error bodies are shown on one line, preferring the API's own message.
     assert(apiErrorMessage(#"{"error":{"type":"x","message":"Rate limited. Please try again later."}}"#)

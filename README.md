@@ -46,6 +46,10 @@ The token is only ever read. The app **does not use the refresh token** — refr
 
 Nothing leaves your machine beyond the requests to `api.anthropic.com` and `claude.ai`.
 
+## Which account the menu bar shows
+
+The figure next to the icon follows the account signed into Claude Code — the fuller of its two windows, with the time until it frees up once it reaches 100%. The **Menu bar shows** submenu switches it to another account or to the most used one. The choice is stored as `"menu_bar_account"` in the config (`"*most-used"` for the most used account; leave it out for the default), which is also how the portable build is set. A chosen account that cannot be read at the moment falls back to the Claude Code account, and with no Claude Code login the most used account stands in.
+
 ## Interface language
 
 English and Polish, switchable from the **Language** submenu. Without an explicit setting the app follows your system locale and falls back to English. The choice is stored as `"language"` in the config file, so you can also set it by hand:
