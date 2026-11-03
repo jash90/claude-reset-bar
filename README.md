@@ -78,9 +78,13 @@ The countdown on a snapshot row stays truthful, because `resets_at` does not mov
 
 **3. Add it with an OAuth token.** Run `claude setup-token` while signed into that account and paste the `sk-ant-oat…` token it prints. The token is checked against the usage endpoint before it is saved; if it is refused, use a `sessionKey` instead.
 
-On macOS, **Add account…** takes either kind of key and tells them apart by the prefix. A sessionKey needs a name. For a token the name is optional, and the account's email is used.
+On macOS everything about accounts happens in one window, **Manage accounts…**, with no dialogs. **Add account…** in the menu opens the same window with the cursor in its form. The list shows every account: what kind it is, where its key is stored, and how its last poll went.
 
-**Manage accounts…** opens a window with every account in one list: what kind it is, where its key is stored, and how its last poll went. For an account you added, **Replace key…** swaps in a new key, which is checked first just like a new account, and **Remove** deletes the account together with its key. Claude Code logins are listed too, greyed out. They belong to Claude Code and go away when you sign out of them.
+- **Add** — type a name and a key in the form under the list and press Return or **Add**. Either kind of key works; the app tells them apart by the prefix. A sessionKey needs a name; for a token the name is optional and the account's email is used. The key is checked before anything is saved, and a problem is reported on the line at the bottom of the window.
+- **Rename** — double-click the name and press Return. The key in the Keychain moves along with it.
+- **Replace the key** — double-click the key cell, paste the new key and press Return. The key is never shown; it is checked like a new one, and the old one stays if the check fails. Escape abandons an edit.
+- **Remove** — select the account and click **Remove** twice. The second click deletes it together with its key.
+- **Hide / Show** — Claude Code logins belong to Claude Code, so their key cannot be changed or deleted here: that would sign Claude Code out. They can be hidden from the menu instead (`hidden_logins` in the config) and shown again from the same window.
 
 ### Where added keys are kept
 

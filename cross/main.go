@@ -92,11 +92,14 @@ type OAuthAccount struct {
 }
 
 type Config struct {
-	Accounts             []Account      `json:"accounts"`
-	OAuthAccounts        []OAuthAccount `json:"oauth_accounts,omitempty"`
-	CheckIntervalMinutes int            `json:"check_interval_minutes,omitempty"`
-	SlackWebhookURL      string         `json:"slack_webhook_url,omitempty"`
-	Language             string         `json:"language,omitempty"`
+	Accounts      []Account      `json:"accounts"`
+	OAuthAccounts []OAuthAccount `json:"oauth_accounts,omitempty"`
+	// HiddenLogins are emails of Claude Code logins hidden from the menu by the macOS app's
+	// accounts window. Hiding never touches the login itself.
+	HiddenLogins         []string `json:"hidden_logins,omitempty"`
+	CheckIntervalMinutes int      `json:"check_interval_minutes,omitempty"`
+	SlackWebhookURL      string   `json:"slack_webhook_url,omitempty"`
+	Language             string   `json:"language,omitempty"`
 }
 
 // window is one limit window: how much of it is used and when it starts over.
@@ -953,7 +956,7 @@ func mergeStale(live []reading, stale map[string]reading) []reading {
 func poll() {
 	cfg := loadConfig()
 	configured := map[string]bool{}
-	for _, name := range cfg.configuredNames() {
+	for _, name := range append(cfg.configuredNames(), cfg.HiddenLogins...) {
 		configured[name] = true
 	}
 

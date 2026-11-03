@@ -29,11 +29,10 @@ struct UIStrings {
     let authRejected: String
     let httpError: String
     let shapeError: String
+    let rateLimited: String
 
-    let addAccountTitle: String
     let addAccountHint: String
     let addButton: String
-    let cancelButton: String
     let namePlaceholder: String
     let keyPlaceholder: String
 
@@ -47,28 +46,34 @@ struct UIStrings {
     let keyMissing: String
     let keychainFailed: String  // "Could not save the key in the Keychain (error %d)."
 
-    let removeTitle: String     // "Remove %@?"
-    let removeHint: String
     let removeButton: String
 
     let manageAccounts: String
     let accountsTitle: String
     let colAccount: String
     let colType: String
-    let colStorage: String
+    let colKey: String
     let colStatus: String
     let typeClaudeCode: String
     let typeSessionKey: String
     let typeToken: String
-    let storageClaudeCode: String
-    let storageKeychain: String
-    let storageConfig: String
+    let keyInKeychain: String
+    let keyInConfig: String
+    let keyClaudeCode: String
     let statusLine: String      // "5h %@ · 7d %@"
-    let replaceKey: String
-    let replaceKeyTitle: String // "New key for %@"
-    let replaceKeyHint: String
-    let saveButton: String
+    let statusHidden: String
     let wrongKeyKind: String    // "This account needs a %@."
+    let confirmRemove: String
+    let hideLogin: String
+    let showLogin: String
+    let checking: String
+    let editHint: String
+    let msgAdded: String        // "Added %@."
+    let msgKeyReplaced: String  // "New key saved for %@."
+    let msgRemoved: String      // "Removed %@."
+    let msgRenamed: String      // "Renamed to %@."
+    let msgHidden: String       // "%@ is hidden from the menu."
+    let msgShown: String        // "%@ is shown in the menu again."
 }
 
 let languages: [String: UIStrings] = [
@@ -100,13 +105,12 @@ let languages: [String: UIStrings] = [
                     + "token, or add the account again with a fresh sessionKey.",
         httpError: "HTTP %d: %@",
         shapeError: "Unexpected response shape — the private API may have changed.",
+        rateLimited: "The API is limiting requests — trying again at the next refresh.",
 
-        addAccountTitle: "Add a Claude account",
         addAccountHint: "Paste a sessionKey (DevTools → Application → Cookies → claude.ai → sessionKey) "
                       + "or an OAuth token from `claude setup-token`. For a token the name is optional "
                       + "— the account's email is used.",
         addButton: "Add",
-        cancelButton: "Cancel",
         namePlaceholder: "Account name (e.g. personal)",
         keyPlaceholder: "sk-ant-sid… or sk-ant-oat…",
 
@@ -122,29 +126,34 @@ let languages: [String: UIStrings] = [
                   + "and add it again.",
         keychainFailed: "Could not save the key in the Keychain (error %d).",
 
-        removeTitle: "Remove %@?",
-        removeHint: "It is taken out of the config file and its key out of the Keychain. Accounts "
-                  + "signed into Claude Code are not listed here — they go away when you sign out of them.",
         removeButton: "Remove",
 
         manageAccounts: "Manage accounts…",
         accountsTitle: "Accounts",
         colAccount: "Account",
         colType: "Type",
-        colStorage: "Key stored in",
+        colKey: "Key",
         colStatus: "Status",
         typeClaudeCode: "Claude Code login",
         typeSessionKey: "sessionKey",
         typeToken: "OAuth token",
-        storageClaudeCode: "Claude Code (Keychain)",
-        storageKeychain: "Keychain",
-        storageConfig: "Config file (plain text)",
+        keyInKeychain: "•••••••• in Keychain — double-click to change",
+        keyInConfig: "in the config file — double-click to change",
+        keyClaudeCode: "managed by Claude Code",
         statusLine: "5h %@ · 7d %@",
-        replaceKey: "Replace key…",
-        replaceKeyTitle: "New key for %@",
-        replaceKeyHint: "The new key is checked before it replaces the old one, and is saved in the Keychain.",
-        saveButton: "Save",
-        wrongKeyKind: "This account needs a %@."
+        statusHidden: "Hidden from the menu",
+        wrongKeyKind: "This account needs a %@.",
+        confirmRemove: "Click again to remove",
+        hideLogin: "Hide",
+        showLogin: "Show",
+        checking: "Checking the key…",
+        editHint: "Double-click a name or a key to edit it. Press Return to save.",
+        msgAdded: "Added %@.",
+        msgKeyReplaced: "New key saved for %@.",
+        msgRemoved: "Removed %@.",
+        msgRenamed: "Renamed to %@.",
+        msgHidden: "%@ is hidden from the menu.",
+        msgShown: "%@ is shown in the menu again."
     ),
     "pl": UIStrings(
         refreshNow: "Odśwież teraz",
@@ -174,13 +183,12 @@ let languages: [String: UIStrings] = [
                     + "token, albo dodaj konto ponownie z nowym sessionKey.",
         httpError: "HTTP %d: %@",
         shapeError: "Nieoczekiwany kształt odpowiedzi — prywatne API mogło się zmienić.",
+        rateLimited: "API ogranicza liczbę zapytań — spróbuję przy następnym odświeżeniu.",
 
-        addAccountTitle: "Dodaj konto Claude",
         addAccountHint: "Wklej sessionKey (DevTools → Application → Cookies → claude.ai → sessionKey) "
                       + "albo token OAuth z `claude setup-token`. Przy tokenie nazwa jest opcjonalna "
                       + "— zostanie użyty e-mail konta.",
         addButton: "Dodaj",
-        cancelButton: "Anuluj",
         namePlaceholder: "Nazwa konta (np. prywatne)",
         keyPlaceholder: "sk-ant-sid… albo sk-ant-oat…",
 
@@ -195,29 +203,34 @@ let languages: [String: UIStrings] = [
         keyMissing: "Brak klucza tego konta w pęku kluczy — usuń konto i dodaj je ponownie.",
         keychainFailed: "Nie udało się zapisać klucza w pęku kluczy (błąd %d).",
 
-        removeTitle: "Usunąć %@?",
-        removeHint: "Zostanie usunięte z pliku konfiguracji, a jego klucz z pęku kluczy. Konta "
-                  + "zalogowane w Claude Code nie są tu wymienione — znikają, gdy się z nich wylogujesz.",
         removeButton: "Usuń",
 
         manageAccounts: "Zarządzaj kontami…",
         accountsTitle: "Konta",
         colAccount: "Konto",
         colType: "Rodzaj",
-        colStorage: "Klucz zapisany w",
+        colKey: "Klucz",
         colStatus: "Stan",
         typeClaudeCode: "Logowanie Claude Code",
         typeSessionKey: "sessionKey",
         typeToken: "token OAuth",
-        storageClaudeCode: "Claude Code (pęk kluczy)",
-        storageKeychain: "Pęk kluczy",
-        storageConfig: "Plik konfiguracji (jawnie)",
+        keyInKeychain: "•••••••• w pęku kluczy — kliknij dwukrotnie, by zmienić",
+        keyInConfig: "w pliku konfiguracji — kliknij dwukrotnie, by zmienić",
+        keyClaudeCode: "zarządza nim Claude Code",
         statusLine: "5h %@ · 7d %@",
-        replaceKey: "Zmień klucz…",
-        replaceKeyTitle: "Nowy klucz dla %@",
-        replaceKeyHint: "Nowy klucz zostanie sprawdzony, zanim zastąpi stary, i zapisany w pęku kluczy.",
-        saveButton: "Zapisz",
-        wrongKeyKind: "To konto wymaga klucza typu: %@."
+        statusHidden: "Ukryte w menu",
+        wrongKeyKind: "To konto wymaga klucza typu: %@.",
+        confirmRemove: "Kliknij ponownie, aby usunąć",
+        hideLogin: "Ukryj",
+        showLogin: "Pokaż",
+        checking: "Sprawdzam klucz…",
+        editHint: "Kliknij dwukrotnie nazwę lub klucz, aby je edytować. Return zapisuje.",
+        msgAdded: "Dodano %@.",
+        msgKeyReplaced: "Zapisano nowy klucz dla %@.",
+        msgRemoved: "Usunięto %@.",
+        msgRenamed: "Zmieniono nazwę na %@.",
+        msgHidden: "%@ ukryto w menu.",
+        msgShown: "%@ znów jest widoczne w menu."
     ),
 ]
 
