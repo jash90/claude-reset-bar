@@ -1,6 +1,6 @@
 <img src="assets/icon_128.png" align="right" width="128" alt="">
 
-# ClaudeResetBar
+# Claude Reset Bar
 
 A menu bar / system tray icon that shows your Claude usage limits and **notifies you the moment a limit resets** — so you stop guessing when you can get back to work.
 
@@ -25,7 +25,7 @@ Each window carries a fill gauge alongside the number, so you can judge how much
 
 Grab the package for your system from [Releases](../../releases).
 
-**macOS** — unzip and drag `ClaudeResetBar.app` into `/Applications`, then open it. The app is signed with a Developer ID certificate and notarized by Apple, with the ticket stapled into the bundle, so it launches on a double-click and Gatekeeper stays quiet even on a machine that is offline.
+**macOS** — unzip and drag `Claude Reset Bar.app` into `/Applications`, then open it. The app is signed with a Developer ID certificate and notarized by Apple, with the ticket stapled into the bundle, so it launches on a double-click and Gatekeeper stays quiet even on a machine that is offline.
 
 **Windows** — unzip and run `claude-reset-bar.exe`. SmartScreen will warn about an unknown publisher (no code signature): *More info* → *Run anyway*.
 
@@ -84,21 +84,21 @@ The countdown on a snapshot row stays truthful, because `resets_at` does not mov
 
 **3. Add it with an OAuth token.** Run `claude setup-token` while signed into that account and paste the `sk-ant-oat…` token it prints. Such a token only carries the inference scope: the usage endpoint refuses it and the account's email cannot be read, so give it a name. The app then reads the limits from the headers of a one-token request instead — a few dozen tokens of that account per poll. The request goes to Fable, because only a response from the capped model reports its weekly cap, so those tokens count against the Fable limit; an account that cannot use Fable is asked on the smallest model and shows no per-model line. The token is checked this way before it is saved.
 
-On macOS everything about accounts happens in one window, **Manage accounts…**, with no dialogs. **Add account…** in the menu opens the same window with the cursor in its form. The list shows every account: what kind it is, where its key is stored, and how its last poll went.
+Everything about accounts happens in one window, **Manage accounts…**, with no dialogs. **Add account…** in the menu opens the same window with the cursor in its form. The list shows every account: what kind it is, where its key is stored, and how its last poll went.
 
 - **Add** — type a name and a key in the form under the list and press Return or **Add**. Either kind of key works; the app tells them apart by the prefix. A sessionKey needs a name; for a token the name is optional and the account's email is used. The key is checked before anything is saved, and a problem is reported on the line at the bottom of the window.
-- **Rename** — double-click the name and press Return. The key in the Keychain moves along with it.
+- **Rename** — double-click the name and press Return. The stored key moves along with it.
 - **Replace the key** — double-click the key cell, paste the new key and press Return. The key is never shown; it is checked like a new one, and the old one stays if the check fails. Escape abandons an edit.
-- **Remove** — select the account and click **Remove** twice. The second click deletes it together with its key.
+- **Remove** — click the account's **Remove** button twice. The second click deletes it together with its key.
 - **Hide / Show** — Claude Code logins belong to Claude Code, so their key cannot be changed or deleted here: that would sign Claude Code out. They can be hidden from the menu instead (`hidden_logins` in the config) and shown again from the same window.
 
 ### Where added keys are kept
 
 On macOS a key you add goes into the login Keychain (service `ClaudeResetBar`, account `sessionKey:<name>` or `token:<name>`), not into the config file. The config only names the account and marks it `"keychain": true`. A key that is still written in plain text in the config, for example a hand-written entry, is moved into the Keychain on the next poll and blanked in the file. Such an entry no longer carries its key, so the claude-reset CLI cannot use it any more.
 
-Windows and Linux have no Keychain, so the portable build keeps keys in the config file (readable only by you, `0600`). The portable build running on macOS cannot read the app's Keychain items without a password prompt on every poll, so it reports where the key is instead of polling that account.
+On Windows a key added in the window goes into Credential Manager, on Linux into the Secret Service (GNOME Keyring, KWallet), under the same names. If the system has no such store the key stays in the config file (readable only by you, `0600`). A hand-written key is left in the file on these systems.
 
-In the portable build (Windows, Linux) you edit the config file; the menu has an entry that opens it. The config lives in `~/.config/claude-reset/config.json`, and its `accounts` list keeps the format of the [claude-reset](https://github.com/nazarli-shabnam/claude-reset) CLI:
+The config can also be edited by hand; the menu has an entry that opens it. It lives in `~/.config/claude-reset/config.json`, and its `accounts` list keeps the format of the [claude-reset](https://github.com/nazarli-shabnam/claude-reset) CLI:
 
 ```json
 {
@@ -113,7 +113,7 @@ In the portable build (Windows, Linux) you edit the config file; the menu has an
 }
 ```
 
-`org_id` can be left out of a `sessionKey` entry: both builds look it up from the key on the next poll and write it into the file, leaving everything else in it as it was.
+`org_id` can be left out of a `sessionKey` entry: the app looks it up from the key on the next poll and write it into the file, leaving everything else in it as it was.
 
 An account added by key under the same name as a Claude Code login (its email) replaces that login's row instead of appearing twice. Under a different name, it shows up twice.
 
@@ -127,25 +127,20 @@ On every poll the `resets_at` timestamp is compared with the previous one. A jum
 
 ## Building from source
 
-The repository holds two implementations of the same thing:
-
-| | `src/*.swift` | `cross/*.go` |
-|---|---|---|
-| Systems | macOS | macOS, Windows, Linux |
-| Dependencies | none (AppKit) | `fyne.io/systray`, `gen2brain/beeep` |
-| Text beside the icon | yes | macOS only |
-| **Add account…** dialog | yes | no (edit the file) |
+The app is written in Rust and lives in `rust/`: `tray-icon` for the tray on macOS and Windows, `ksni` on Linux, `egui` for the accounts window, `keyring` for the system key store, `ureq` and `rayon` for polling.
 
 ```bash
-./build.sh                     # macOS native → build/ClaudeResetBar.app
-cd cross && ./build.sh         # current system
-cd cross && ./build.sh --all   # plus Windows and Linux
+./build.sh                     # macOS → "build/Claude Reset Bar.app" (signed when a Developer ID is present)
+cd rust && ./build.sh          # bare binary for the current system → rust/build/
+cd rust && ./build.sh --all    # plus Windows and Linux
 ./release.sh v1.0.0            # release packages → dist/
 ```
 
-Requirements: Xcode Command Line Tools for the Swift build, Go 1.21+ for the portable one. macOS only builds natively (CGO/AppKit); Windows and Linux cross-compile from any system.
+Requirements: a Rust toolchain; the macOS bundle also needs the Xcode Command Line Tools, and is universal when both Apple targets are installed (`rustup target add aarch64-apple-darwin x86_64-apple-darwin`). `--all` cross-compiles Windows and Linux from any system with zig as the linker (`brew install zig`, `cargo install cargo-zigbuild`), so it needs neither a Windows SDK nor a Linux sysroot. The Linux binary speaks the tray protocol over D-Bus itself and links against nothing but libc.
 
-Both builds run a self-check during the build (`--test` in the Go one): reset detection, duration formatting, icon generation, language resolution, config parsing. `--notify` checks whether notifications get through on a given system without waiting for a real reset. `--icons <dir>` regenerates the icon set.
+A poll reads all accounts in parallel (`rayon`), so a poll takes as long as its slowest account, not the sum of them.
+
+The build runs a self-check (`--test`): reset detection, duration formatting, icon generation, language resolution, config parsing. `--notify` checks whether notifications get through on a given system without waiting for a real reset. `--once` reads every account once and prints the menu rows without starting the tray. `--icons <dir>` regenerates the icon set.
 
 ## Credits
 

@@ -10,15 +10,15 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 
 echo "── icons ────────────────────────────────────────────"
-(cd "$DIR/cross" && go build -o build/.icons . && ./build/.icons --icons "$DIR/assets" && rm -f build/.icons)
+(cd "$DIR/rust" && cargo run --release --quiet -- --icons "$DIR/assets")
 
 echo "── portable binaries ────────────────────────────────"
-(cd "$DIR/cross" && ./build.sh --all)
+"$DIR/rust/build.sh" --all
 
 echo "── Windows package ──────────────────────────────────"
 WIN="$DIST/win/claude-reset-bar"
 mkdir -p "$WIN"
-cp "$DIR/cross/build/claude-reset-bar.exe" "$WIN/"
+cp "$DIR/rust/build/claude-reset-bar.exe" "$WIN/"
 cp "$DIR/assets/icon.ico" "$DIR/README.md" "$DIR/LICENSE" "$WIN/"
 # Contents nested in a folder so extracting does not scatter files into the target dir.
 (cd "$DIST/win" && zip -qr "$DIST/claude-reset-bar-$VERSION-windows-amd64.zip" claude-reset-bar)
@@ -28,13 +28,13 @@ echo "── Linux packages ─────────────────�
 for arch in amd64 arm64; do
     LIN="$DIST/linux-$arch/claude-reset-bar"
     mkdir -p "$LIN"
-    cp "$DIR/cross/build/claude-reset-bar-linux-$arch" "$LIN/claude-reset-bar"
+    cp "$DIR/rust/build/claude-reset-bar-linux-$arch" "$LIN/claude-reset-bar"
     cp "$DIR/assets/icon.png" "$LIN/claude-reset-bar.png"
     cp "$DIR/README.md" "$DIR/LICENSE" "$LIN/"
     cat > "$LIN/claude-reset-bar.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
-Name=ClaudeResetBar
+Name=Claude Reset Bar
 Comment=Claude usage limits in the system tray
 Exec=claude-reset-bar
 Icon=claude-reset-bar
@@ -45,12 +45,12 @@ DESKTOP
     rm -rf "$DIST/linux-$arch"
 done
 
-# macOS only builds on macOS — AppKit needs CGO and the local SDK.
+# The macOS bundle is assembled and signed with the local Xcode tools.
 if [ "$(uname)" = "Darwin" ]; then
     echo "── macOS package ────────────────────────────────────"
     VERSION="$VERSION" "$DIR/build.sh" >/dev/null
-    APP="$DIR/build/ClaudeResetBar.app"
-    ZIP="$DIST/ClaudeResetBar-$VERSION-macos-arm64.zip"
+    APP="$DIR/build/Claude Reset Bar.app"
+    ZIP="$DIST/ClaudeResetBar-$VERSION-macos-universal.zip"
     # ditto preserves bundle attributes that a plain zip drops. We pack the .app alone —
     # without --sequesterRsrc, which adds a __MACOSX folder, and with the parent named
     # explicitly so extraction yields the app itself, not the staging directory.

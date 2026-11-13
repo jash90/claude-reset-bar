@@ -8,7 +8,7 @@ mkdir -p build
 
 # The hourglass is deliberately absent: the exhausted-window title spells out the
 # remaining time instead, which stays legible where the glyph does not render.
-if grep -n '⏳' "$DIR"/../src/*.swift "$DIR"/*.go "$DIR"/../README.md 2>/dev/null; then
+if grep -n '⏳' "$DIR"/*.go "$DIR"/../rust/src/*.rs "$DIR"/../README.md 2>/dev/null; then
     echo "Hourglass character found in the sources listed above." >&2
     exit 1
 fi

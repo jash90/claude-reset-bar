@@ -1,27 +1,39 @@
 #!/bin/bash
-# Builds ClaudeResetBar.app. No dependencies — Xcode Command Line Tools are enough.
+# Builds "Claude Reset Bar.app" from the Rust sources in rust/. Needs a Rust toolchain and the
+# Xcode Command Line Tools.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="$DIR/build/ClaudeResetBar.app"
+APP="$DIR/build/Claude Reset Bar.app"
 
 # The hourglass is deliberately absent: the exhausted-window title spells out the
 # remaining time instead, which stays legible where the glyph does not render.
-if grep -n '⏳' "$DIR"/src/*.swift "$DIR"/cross/*.go "$DIR"/README.md 2>/dev/null; then
+if grep -n '⏳' "$DIR"/rust/src/*.rs "$DIR"/README.md 2>/dev/null; then
     echo "Hourglass character found in the sources listed above." >&2
     exit 1
 fi
 
-# Self-check of the reset-detection logic — the build fails if an assertion trips.
-swiftc -Onone "$DIR/src/"*.swift -o "$DIR/build/.selfcheck" -module-name ClaudeResetBar 2>/dev/null \
-  || { mkdir -p "$DIR/build"; swiftc -Onone "$DIR/src/"*.swift -o "$DIR/build/.selfcheck" -module-name ClaudeResetBar; }
-"$DIR/build/.selfcheck" --test
+# The program is the Rust build. Its self-check runs first — the build fails if an
+# assertion trips. With both Apple targets installed the binary is universal; otherwise it
+# is built for this machine's processor only.
+BIN_NAME="claude-reset-bar"
+( cd "$DIR/rust" && cargo build --release --locked && ./target/release/$BIN_NAME --test )
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O "$DIR/src/"*.swift -o "$APP/Contents/MacOS/ClaudeResetBar" -module-name ClaudeResetBar
+TARGETS="$(rustup target list --installed 2>/dev/null | grep -E '^(aarch64|x86_64)-apple-darwin$' || true)"
+if [ "$(printf '%s\n' "$TARGETS" | grep -c .)" = 2 ]; then
+    SLICES=()
+    for target in $TARGETS; do
+        ( cd "$DIR/rust" && cargo build --release --locked --target "$target" )
+        SLICES+=("$DIR/rust/target/$target/release/$BIN_NAME")
+    done
+    lipo -create "${SLICES[@]}" -output "$APP/Contents/MacOS/ClaudeResetBar"
+else
+    cp "$DIR/rust/target/release/$BIN_NAME" "$APP/Contents/MacOS/ClaudeResetBar"
+fi
 
-# Application icon. The PNG set comes from `cross/claude-reset-bar --icons assets`;
+# Application icon. The PNG set comes from `rust/build/claude-reset-bar --icons assets`;
 # iconutil assembles the .icns that Finder and the Dock require.
 if [ -f "$DIR/assets/icon_1024.png" ]; then
     ICONSET="$DIR/build/AppIcon.iconset"
@@ -44,7 +56,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>ClaudeResetBar</string>
+  <key>CFBundleName</key><string>Claude Reset Bar</string>
+  <key>CFBundleDisplayName</key><string>Claude Reset Bar</string>
   <key>CFBundleExecutable</key><string>ClaudeResetBar</string>
   <key>CFBundleIdentifier</key><string>local.claude-reset-bar</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
@@ -73,7 +86,5 @@ else
     echo "Signed ad-hoc — no Developer ID certificate on this machine."
 fi
 codesign --verify --strict --verbose=1 "$APP"
-
-rm -f "$DIR/build/.selfcheck"
 
 echo "Built: $APP"
