@@ -71,6 +71,95 @@ type UsageResponse struct {
 	SevenDayOpus   *UsageWindow `json:"seven_day_opus"`
 	SevenDaySonnet *UsageWindow `json:"seven_day_sonnet"`
 	Limits         []UsageLimit `json:"limits"`
+	// The limit resets the account holds. Only sent when the request asks for it. Kept
+	// raw: the block is undocumented, and one that has changed shape should cost its own
+	// lines, not the account's whole reading.
+	CedarEmber json.RawMessage `json:"cedar_ember"`
+}
+
+// resetCount is how many resets of one kind an account still holds. kind is "full",
+// "session", or a model's name in lower case.
+type resetCount struct {
+	kind  string
+	count int
+}
+
+// resetKind names a reset from the limits it clears. One that clears the weekly limit is a
+// full reset, whatever else it clears with it; one for the 5-hour window alone is a session
+// reset; anything else clears one model's weekly cap and carries that model's name.
+func resetKind(clears []string) string {
+	has := func(name string) bool {
+		for _, c := range clears {
+			if c == name {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("seven_day"):
+		return "full"
+	case has("five_hour"):
+		return "session"
+	case len(clears) == 0:
+		return ""
+	// The models billed against the plan beyond its base allowance — today that is Fable.
+	case clears[0] == "seven_day_overage_included":
+		return "fable"
+	}
+	return strings.TrimPrefix(clears[0], "seven_day_")
+}
+
+// resetCounts adds up the resets still to be used per kind: the full one first, then the
+// rest by name. A grant that is spent or past its end date counts for nothing.
+func resetCounts(block json.RawMessage, now time.Time) []resetCount {
+	var status struct {
+		Grants []json.RawMessage `json:"grants"`
+	}
+	if json.Unmarshal(block, &status) != nil {
+		return nil
+	}
+	totals := map[string]int{}
+	for _, raw := range status.Grants {
+		var g struct {
+			Clears     []string `json:"clears"`
+			ResetsLeft int      `json:"resets_left"`
+			EndsAt     *string  `json:"ends_at"`
+		}
+		kind := ""
+		if json.Unmarshal(raw, &g) == nil {
+			kind = resetKind(g.Clears)
+		}
+		if kind == "" || g.ResetsLeft <= 0 {
+			continue
+		}
+		if g.EndsAt != nil {
+			if end, ok := parseISO(*g.EndsAt); ok && !end.After(now) {
+				continue
+			}
+		}
+		totals[kind] += g.ResetsLeft
+	}
+	rank := func(kind string) int {
+		switch kind {
+		case "full":
+			return 0
+		case "session":
+			return 1
+		}
+		return 2
+	}
+	out := make([]resetCount, 0, len(totals))
+	for kind, count := range totals {
+		out = append(out, resetCount{kind, count})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if ri, rj := rank(out[i].kind), rank(out[j].kind); ri != rj {
+			return ri < rj
+		}
+		return out[i].kind < out[j].kind
+	})
+	return out
 }
 
 // Account is an extra account read with a claude.ai sessionKey — the shape the
@@ -120,6 +209,7 @@ type reading struct {
 	fiveHour *window
 	sevenDay *window
 	models   []modelWindow
+	resets   []resetCount
 	active   bool
 	err      string
 	// lastSeen is zero for a live account. It is set when the account can no longer be
@@ -445,17 +535,23 @@ func (e statusError) Error() string {
 	return fmt.Sprintf("HTTP %d", int(e))
 }
 
+// The usage endpoint lists an account's limit resets only for a request that names the
+// Claude Code CLI; any other client is told the account is not eligible.
+const claudeCodeUserAgent = "claude-cli/2.1.323 (external, cli)"
+
 func anthropicReq(path, token string) *http.Request {
 	req, _ := http.NewRequest("GET", "https://api.anthropic.com"+path, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	req.Header.Set("User-Agent", claudeCodeUserAgent)
 	return req
 }
 
 func fetchUsageOAuth(token string) (UsageResponse, error) {
 	var u UsageResponse
-	return u, doJSON(anthropicReq("/api/oauth/usage", token), &u)
+	// cedar_ember=1 asks for the limit resets on top of the usual reading.
+	return u, doJSON(anthropicReq("/api/oauth/usage?cedar_ember=1", token), &u)
 }
 
 // A token from `claude setup-token` carries only the user:inference scope. The usage
@@ -464,32 +560,116 @@ func fetchUsageOAuth(token string) (UsageResponse, error) {
 // (anthropic-ratelimit-unified-5h-utilization, -7d-utilization, -5h-reset, ...). So for such
 // a token the limits are read from a one-token request. It costs that account a few dozen
 // tokens per poll. count_tokens would be free, but it does not send these headers.
+//
+// A weekly cap that applies to one model only is reported solely on a request to that
+// model, as a second weekly claim (anthropic-ratelimit-unified-7d_<claim>-utilization). So
+// the probe goes to the capped model, and its few dozen tokens count against that cap. An
+// account that may not use the model is probed on the smallest one instead and shows no
+// per-model line.
 
-// probeModel is the model of the one-token probe: the smallest current one.
-const probeModel = "claude-haiku-5-5"
+// probeModel is one model the probe can be sent to. scopedLabel names the per-model weekly
+// cap its response reports; empty when the model has none.
+type probeModel struct {
+	id          string
+	scopedLabel string
+}
+
+var (
+	// scopedProbe is the model with a weekly cap of its own.
+	scopedProbe = probeModel{id: "claude-fable-5-2", scopedLabel: "Fable"}
+	// plainProbe is the smallest current model: the probe for accounts the capped model
+	// turns away.
+	plainProbe = probeModel{id: "claude-haiku-5-5"}
+)
+
+const limitHeaderPrefix = "Anthropic-Ratelimit-Unified-"
 
 // usageFromHeaders turns the unified rate-limit headers into the shape the usage endpoint
-// returns. Utilization comes as a fraction (0.16), the reset as Unix seconds.
-func usageFromHeaders(h http.Header) (UsageResponse, bool) {
+// returns. Utilization comes as a fraction (0.16), the reset as Unix seconds. A scoped
+// weekly claim becomes a "weekly_scoped" entry under scopedLabel, the model the request
+// went to.
+func usageFromHeaders(h http.Header, scopedLabel string) (UsageResponse, bool) {
 	window := func(tag string) *UsageWindow {
-		raw := h.Get("anthropic-ratelimit-unified-" + tag + "-utilization")
+		raw := h.Get(limitHeaderPrefix + tag + "-utilization")
 		var fraction float64
 		if _, err := fmt.Sscanf(raw, "%g", &fraction); raw == "" || err != nil {
 			return nil
 		}
 		w := &UsageWindow{Utilization: ptr(fraction * 100)}
 		var reset int64
-		if _, err := fmt.Sscanf(h.Get("anthropic-ratelimit-unified-"+tag+"-reset"), "%d", &reset); err == nil {
+		if _, err := fmt.Sscanf(h.Get(limitHeaderPrefix+tag+"-reset"), "%d", &reset); err == nil {
 			w.ResetsAt = ptr(time.Unix(reset, 0).UTC().Format(time.RFC3339))
 		}
 		return w
 	}
 	u := UsageResponse{FiveHour: window("5h"), SevenDay: window("7d")}
-	return u, u.FiveHour != nil || u.SevenDay != nil
+	if u.FiveHour == nil && u.SevenDay == nil {
+		return u, false
+	}
+	if scopedLabel == "" {
+		return u, true
+	}
+	// The claim's own name ("7d_oi") is opaque, so any scoped weekly claim is taken; should
+	// a response carry several, the fullest one is the one that limits the model.
+	var scoped *UsageWindow
+	for key := range h {
+		tag, ok := strings.CutPrefix(strings.ToLower(key), strings.ToLower(limitHeaderPrefix))
+		if !ok || !strings.HasPrefix(tag, "7d_") || !strings.HasSuffix(tag, "-utilization") {
+			continue
+		}
+		if w := window(strings.TrimSuffix(tag, "-utilization")); w != nil &&
+			(scoped == nil || *w.Utilization > *scoped.Utilization) {
+			scoped = w
+		}
+	}
+	if scoped != nil {
+		l := UsageLimit{Kind: "weekly_scoped", Group: "weekly", Percent: scoped.Utilization, ResetsAt: scoped.ResetsAt}
+		_ = json.Unmarshal([]byte(fmt.Sprintf(`{"model":{"display_name":%q}}`, scopedLabel)), &l.Scope)
+		u.Limits = []UsageLimit{l}
+	}
+	return u, true
 }
 
+// scopedProbeRefusedUntil remembers tokens the capped model turned away, and until when to
+// probe the smallest one for them. Only touched from poll, which runs one at a time.
+var scopedProbeRefusedUntil = map[string]time.Time{}
+
+// modelIsRefused tells whether a failed probe says the account may not use the model at
+// all, as opposed to the API having a bad moment: 403 for no access, 404 or 400 for a
+// model it does not offer.
+func modelIsRefused(err error) bool {
+	var se statusError
+	return errors.As(err, &se) && (se == 400 || se == 403 || se == 404)
+}
+
+// fetchUsageFromHeaders reads limits for a token the usage endpoint refuses. The capped
+// model is asked first, because only its response carries the per-model weekly cap. When
+// it answers without limit headers the smallest model is asked instead; when the answer
+// was that the account may not use the capped model, for the next day directly.
 func fetchUsageFromHeaders(token string) (UsageResponse, error) {
-	body := `{"model":"` + probeModel + `","max_tokens":1,` +
+	if time.Now().Before(scopedProbeRefusedUntil[token]) {
+		return probeUsage(token, plainProbe)
+	}
+	u, retry, first := probeUsageOnce(token, scopedProbe)
+	if !retry {
+		return u, first
+	}
+	u, err := probeUsage(token, plainProbe)
+	if err == nil && modelIsRefused(first) {
+		scopedProbeRefusedUntil[token] = time.Now().Add(24 * time.Hour)
+	}
+	return u, err
+}
+
+func probeUsage(token string, model probeModel) (UsageResponse, error) {
+	u, _, err := probeUsageOnce(token, model)
+	return u, err
+}
+
+// probeUsageOnce sends the one-token request. retry reports that the API answered without
+// limit headers and without rejecting the token outright, so another model may fare better.
+func probeUsageOnce(token string, model probeModel) (u UsageResponse, retry bool, err error) {
+	body := `{"model":"` + model.id + `","max_tokens":1,` +
 		// OAuth tokens are only accepted for requests that present themselves as Claude Code.
 		`"system":"You are Claude Code, Anthropic's official CLI for Claude.",` +
 		`"messages":[{"role":"user","content":"hi"}]}`
@@ -500,20 +680,20 @@ func fetchUsageFromHeaders(token string) (UsageResponse, error) {
 	req.Header.Set("content-type", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return UsageResponse{}, fmt.Errorf(T().networkError, err)
+		return UsageResponse{}, false, fmt.Errorf(T().networkError, err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return UsageResponse{}, statusError(resp.StatusCode)
+		return UsageResponse{}, resp.StatusCode == 403, statusError(resp.StatusCode)
 	}
 	// A 429 from inference still carries the headers — and then they matter most.
-	if u, ok := usageFromHeaders(resp.Header); ok {
-		return u, nil
+	if u, ok := usageFromHeaders(resp.Header, model.scopedLabel); ok {
+		return u, false, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return UsageResponse{}, statusError(resp.StatusCode)
+		return UsageResponse{}, true, statusError(resp.StatusCode)
 	}
-	return UsageResponse{}, fmt.Errorf(T().badShape, "no limit headers")
+	return UsageResponse{}, true, fmt.Errorf(T().badShape, "no limit headers")
 }
 
 // usageRefusedUntil remembers tokens the usage endpoint turned away, and until when to
@@ -967,6 +1147,7 @@ func toReading(name string, u UsageResponse, err error) reading {
 	if r.fiveHour == nil && r.sevenDay == nil {
 		return reading{name: name, err: T().badTimestamp}
 	}
+	r.resets = resetCounts(u.CedarEmber, time.Now())
 	// Per-model weekly caps arrive two ways depending on the account. The dedicated
 	// fields are the older shape and now usually null; the scoped entries in limits[] are
 	// the current one, and reading them means new model tiers appear without a code change.
@@ -1287,6 +1468,9 @@ func render() {
 			windowLine(T().sevenDayLine, "7d", r.sevenDay))
 		for _, m := range r.models {
 			lines = append(lines, fmt.Sprintf(T().modelLine, bar(m.pct), pct(m.pct), m.label))
+		}
+		for _, c := range r.resets {
+			lines = append(lines, fmt.Sprintf(T().resetLine, c.count, c.kind))
 		}
 	}
 	// The tray figure follows the Claude Code login unless the config picks another account.
@@ -1683,7 +1867,7 @@ func runSelfCheck() {
 	hdr := http.Header{}
 	hdr.Set("anthropic-ratelimit-unified-7d-utilization", "0.16")
 	hdr.Set("anthropic-ratelimit-unified-7d-reset", "1794092400")
-	hu, hok := usageFromHeaders(hdr)
+	hu, hok := usageFromHeaders(hdr, "")
 	hr := toReading("acc", hu, nil)
 	assert(hok && hr.err == "" && hr.sevenDay != nil && math.Abs(hr.sevenDay.pct-16) < 1e-9,
 		"the fraction becomes a percentage")
@@ -1704,8 +1888,56 @@ func runSelfCheck() {
 
 	spent := reading{fiveHour: &window{pct: 0}, sevenDay: &window{pct: 100}}
 	assert(spent.headline().pct == 100, "a spent weekly limit is not hidden behind an empty 5-hour window")
-	_, hok = usageFromHeaders(http.Header{"Content-Type": {"application/json"}})
+	_, hok = usageFromHeaders(http.Header{"Content-Type": {"application/json"}}, "")
 	assert(!hok, "no limit headers, no reading")
+
+	// A request to a model with a weekly cap of its own reports that cap as a second weekly
+	// claim. Headers are the ones a real response to such a request carried.
+	sh := http.Header{}
+	sh.Set("anthropic-ratelimit-unified-7d-utilization", "0.24")
+	sh.Set("anthropic-ratelimit-unified-7d-reset", "1794704400")
+	sh.Set("anthropic-ratelimit-unified-7d-status", "allowed")
+	sh.Set("anthropic-ratelimit-unified-7d_oi-utilization", "0.21")
+	sh.Set("anthropic-ratelimit-unified-7d_oi-reset", "1794704400")
+	sh.Set("anthropic-ratelimit-unified-7d_oi-status", "allowed")
+	sh.Set("anthropic-ratelimit-unified-reset", "1794704400")
+	su, _ := usageFromHeaders(sh, "Fable")
+	sr := toReading("acc", su, nil)
+	assert(sr.sevenDay != nil && math.Abs(sr.sevenDay.pct-24) < 1e-9, "the scoped claim is not taken for the weekly window")
+	assert(len(sr.models) == 1 && sr.models[0].label == "Fable" && math.Abs(sr.models[0].pct-21) < 1e-9,
+		"the scoped claim becomes the model's weekly cap")
+	su, _ = usageFromHeaders(sh, "")
+	assert(len(toReading("acc", su, nil).models) == 0, "a probe to a model without a cap of its own names no model")
+	// Limit resets: counted per kind from the limits each grant clears. The first two
+	// grants are the ones a real response carried; the rest cover what must not count.
+	var ru UsageResponse
+	rerr := json.Unmarshal([]byte(`{"five_hour":null,
+	 "seven_day":{"utilization":24,"resets_at":"2026-11-15T01:00:00+00:00"},
+	 "cedar_ember":{"eligible":true,"grants":[
+	   {"id":"full-reset-2611","resets_total":1,"resets_left":1,"ends_at":"2026-12-10T22:00:00+00:00",
+	    "clears":["seven_day","seven_day_overage_included"],"type":"weekly"},
+	   {"id":"launch-2610-fable","resets_total":1,"resets_left":0,"ends_at":"2027-03-09T07:59:00+00:00",
+	    "clears":["seven_day_overage_included"],"type":"full"},
+	   {"id":"fable-a","resets_left":1,"clears":["seven_day_overage_included"]},
+	   {"id":"fable-b","resets_left":1,"clears":["seven_day_overage_included"],"ends_at":null},
+	   {"id":"opus","resets_left":3,"clears":["seven_day_opus"]},
+	   {"id":"expired","resets_left":5,"clears":["seven_day"],"ends_at":"2026-11-01T00:00:00+00:00"},
+	   {"id":"session","resets_left":1,"clears":["five_hour"]},
+	   {"id":"malformed","resets_left":"many","clears":["seven_day"]},
+	   "not a grant"]}}`), &ru)
+	resetNow, _ := parseISO("2026-11-13T20:00:00+00:00")
+	rc := resetCounts(ru.CedarEmber, resetNow)
+	assert(rerr == nil && len(rc) == 4 && rc[0] == resetCount{"full", 1} && rc[1] == resetCount{"session", 1} &&
+		rc[2] == resetCount{"fable", 2} && rc[3] == resetCount{"opus", 3},
+		"resets are added up per kind; spent, expired and malformed grants count for nothing")
+	var odd UsageResponse
+	assert(json.Unmarshal([]byte(`{"seven_day":{"utilization":1,"resets_at":"2026-11-15T01:00:00+00:00"},"cedar_ember":"soon"}`), &odd) == nil &&
+		toReading("acc", odd, nil).sevenDay != nil && len(toReading("acc", odd, nil).resets) == 0,
+		"an unreadable resets block does not cost the reading")
+	assert(strings.Contains(fmt.Sprintf(T().resetLine, 2, "fable"), "2 x fable reset"), "the line reads as a count of a kind")
+	assert(modelIsRefused(statusError(404)) && modelIsRefused(statusError(403)), "an account without the capped model is remembered")
+	assert(!modelIsRefused(statusError(529)) && !modelIsRefused(statusError(429)) && !modelIsRefused(errors.New("x")),
+		"a passing failure does not hide the model's cap for a day")
 	assert(statusError(403).Error() == fmt.Sprintf(T().authRejected, 403) && statusError(429).Error() == "HTTP 429",
 		"status errors keep the messages they had")
 

@@ -17,6 +17,8 @@ A menu bar / system tray icon that shows your Claude usage limits and **notifies
 
 A third kind of row shows up when your plan caps a single model separately — `Opus only`, `Fable only`, whatever the API reports. Those come from the scoped weekly entries, so a new model tier appears without the app needing a change. If your account has no per-model cap, the row is simply absent.
 
+Under those, an account read through a Claude Code login lists the limit resets it still holds, one line per kind: `1 x full reset`, `2 x fable reset`. A full reset clears the weekly limit; one named after a model clears that model's weekly cap. Spent and expired resets are not shown, and an account added with a `setup-token` token shows none, because the usage endpoint that lists them refuses such a token.
+
 Each window carries a fill gauge alongside the number, so you can judge how much is left without reading digits, and compare accounts at a glance. Any usage at all lights the first cell, so "barely used" never looks like "untouched".
 
 ## Install
@@ -80,7 +82,7 @@ The countdown on a snapshot row stays truthful, because `resets_at` does not mov
 
 **2. Add it with a `sessionKey`.** Find it in DevTools → *Application* → *Cookies* → `claude.ai` → `sessionKey`.
 
-**3. Add it with an OAuth token.** Run `claude setup-token` while signed into that account and paste the `sk-ant-oat…` token it prints. Such a token only carries the inference scope: the usage endpoint refuses it and the account's email cannot be read, so give it a name. The app then reads the limits from the headers of a one-token request to the smallest model instead — a few dozen tokens of that account per poll. The token is checked this way before it is saved.
+**3. Add it with an OAuth token.** Run `claude setup-token` while signed into that account and paste the `sk-ant-oat…` token it prints. Such a token only carries the inference scope: the usage endpoint refuses it and the account's email cannot be read, so give it a name. The app then reads the limits from the headers of a one-token request instead — a few dozen tokens of that account per poll. The request goes to Fable, because only a response from the capped model reports its weekly cap, so those tokens count against the Fable limit; an account that cannot use Fable is asked on the smallest model and shows no per-model line. The token is checked this way before it is saved.
 
 On macOS everything about accounts happens in one window, **Manage accounts…**, with no dialogs. **Add account…** in the menu opens the same window with the cursor in its form. The list shows every account: what kind it is, where its key is stored, and how its last poll went.
 

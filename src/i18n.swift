@@ -19,6 +19,7 @@ struct UIStrings {
     let fiveHourLine: String   // "   5h  <gauge>  %@  resets in %@ (%@)"
     let sevenDayLine: String
     let modelLine: String      // a weekly cap that applies to one model only
+    let resetLine: String      // limit resets the account still holds: "2 x fable reset"
     let idleLine: String       // "   5h  <gauge>  —     no active window": the API reported nothing for it
 
     let fiveHourWindow: String
@@ -97,6 +98,7 @@ let languages: [String: UIStrings] = [
         fiveHourLine: "   5h  %@  %@  resets in %@ (%@)",
         sevenDayLine: "   7d  %@  %@  resets in %@ (%@)",
         modelLine: "   7d  %@  %@  %@ only",
+        resetLine: "   %ld x %@ reset",
         idleLine: "   %@  %@  —     no active window",
 
         fiveHourWindow: "5-hour window",
@@ -178,6 +180,7 @@ let languages: [String: UIStrings] = [
         fiveHourLine: "   5h  %@  %@  reset za %@ (%@)",
         sevenDayLine: "   7d  %@  %@  reset za %@ (%@)",
         modelLine: "   7d  %@  %@  tylko %@",
+        resetLine: "   %ld x %@ reset",
         idleLine: "   %@  %@  —     brak aktywnego okna",
 
         fiveHourWindow: "okno 5-godzinne",
