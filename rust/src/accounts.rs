@@ -10,15 +10,9 @@ use crate::credentials::is_oauth_token;
 use crate::format::pct;
 use crate::http::{self, FetchError};
 use crate::i18n::{fill, t};
+pub use crate::model::RowKind;
 use crate::model::{to_reading, Reading};
 use crate::secrets::{self, key_account, KeyKind};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RowKind {
-    ClaudeCode,
-    SessionKey,
-    Token,
-}
 
 /// One row of the accounts window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,11 +34,7 @@ impl AccountRow {
     }
 
     pub fn type_text(&self) -> &'static str {
-        match self.kind {
-            RowKind::ClaudeCode => t().type_claude_code,
-            RowKind::SessionKey => t().type_session_key,
-            RowKind::Token => t().type_token,
-        }
+        self.kind.type_text()
     }
 
     /// Where the key is kept. The key itself is never shown.
@@ -79,8 +69,8 @@ pub struct EditResult {
 
 type Edit = Result<String, String>;
 
-fn status_text(readings: &[Reading], name: &str) -> String {
-    let Some(r) = readings.iter().find(|r| r.name == name) else { return t().loading.to_string() };
+fn status_text(readings: &[Reading], kind: RowKind, name: &str) -> String {
+    let Some(r) = readings.iter().find(|r| r.kind == kind && r.name == name) else { return t().loading.to_string() };
     if let Some(err) = &r.err {
         return err.clone();
     }
@@ -93,12 +83,19 @@ fn status_text(readings: &[Reading], name: &str) -> String {
 pub fn rows() -> Vec<AccountRow> {
     let cfg = config::load_config();
     let (readings, logins) = app::snapshot();
+    let shadowed = app::shadowed();
     let row = |name: &str, kind, in_store, hidden| AccountRow {
         name: name.to_string(),
         kind,
         in_store,
         hidden,
-        status: if hidden { t().status_hidden.to_string() } else { status_text(&readings, name) },
+        status: if hidden {
+            t().status_hidden.to_string()
+        } else if kind != RowKind::ClaudeCode && shadowed.contains(name) {
+            t().status_same_as_login.to_string()
+        } else {
+            status_text(&readings, kind, name)
+        },
     };
     let mut rows: Vec<AccountRow> = logins.iter().map(|n| row(n, RowKind::ClaudeCode, true, false)).collect();
     rows.extend(cfg.hidden_logins.iter().map(|n| row(n, RowKind::ClaudeCode, true, true)));
@@ -109,14 +106,11 @@ pub fn rows() -> Vec<AccountRow> {
     rows
 }
 
-/// A name already on screen or in the config — two rows under one name would share their
-/// state.
+/// A name another added account already has. Added accounts are told apart by name alone —
+/// their keys are stored under it — but a Claude Code login is an account of another kind,
+/// so a key added for the same account may carry the login's email.
 fn is_taken(name: &str) -> bool {
-    let cfg = config::load_config();
-    let (readings, _) = app::snapshot();
-    readings.iter().any(|r| r.name == name)
-        || cfg.configured_names().iter().any(|n| n == name)
-        || cfg.hidden_logins.iter().any(|n| n == name)
+    config::load_config().configured_names().iter().any(|n| n == name)
 }
 
 /// What checking a key found out about its account.
@@ -137,7 +131,7 @@ fn verify(key: &str) -> Result<VerifiedKey, String> {
         FetchError::Status(code @ (401 | 403)) => fill(t().token_rejected, &[&code.to_string()]),
         other => other.to_string(),
     })?;
-    if to_reading("", Ok(usage)).err.is_some() {
+    if to_reading(RowKind::Token, "", Ok(usage)).err.is_some() {
         return Err(t().shape_error.to_string());
     }
     let email = Some(http::fetch_oauth_label(key)).filter(|email| !email.is_empty());
@@ -195,10 +189,10 @@ fn add(raw_name: &str, raw_key: &str) -> Edit {
     }
     let found = verify(key)?;
     // A token's account is named by its email when no name was given.
-    let name = match (name.is_empty(), found.email) {
+    let name = match (name.is_empty(), &found.email) {
         (false, _) => name.to_string(),
-        (true, Some(email)) if !is_taken(&email) => email,
-        (true, Some(email)) => return Err(fill(t().account_exists, &[&email])),
+        (true, Some(email)) if !is_taken(email) => email.clone(),
+        (true, Some(email)) => return Err(fill(t().account_exists, &[email])),
         (true, None) => return Err(t().token_needs_name.to_string()),
     };
     let in_store = store_key(kind, &name, key)?;
@@ -208,6 +202,10 @@ fn add(raw_name: &str, raw_key: &str) -> Edit {
     }
     if kind == KeyKind::SessionKey {
         entry["org_id"] = json!(found.org_id.unwrap_or_default());
+    }
+    // Tells the poll when this token belongs to the account Claude Code is signed into.
+    if let Some(email) = found.email {
+        entry["email"] = json!(email);
     }
     save(|doc| config::push_entry(doc, list_of(kind), entry))?;
     Ok(fill(t().msg_added, &[&name]))
@@ -234,9 +232,17 @@ fn replace_key(name: &str, row_kind: RowKind, raw_key: &str) -> Edit {
             if let Some(org_id) = &found.org_id {
                 entry.insert("org_id".into(), json!(org_id));
             }
+            // The new key may be another account's: an email it cannot read must not stay
+            // behind from the old one.
+            if kind == KeyKind::Token {
+                match &found.email {
+                    Some(email) => entry.insert("email".into(), json!(email)),
+                    None => entry.remove("email"),
+                };
+            }
         })
     })?;
-    app::drop_baseline(name);
+    app::drop_baseline(row_kind, name);
     Ok(fill(t().msg_key_replaced, &[name]))
 }
 
@@ -266,7 +272,7 @@ fn rename(from: &str, row_kind: RowKind, raw_to: &str) -> Edit {
         secrets::delete(if saved.is_ok() { &old_key } else { &new_key });
     }
     saved?;
-    app::rename_state(from, to);
+    app::rename_state(row_kind, from, to);
     Ok(fill(t().msg_renamed, &[to]))
 }
 
@@ -277,7 +283,8 @@ fn remove(name: &str) -> Edit {
     })?;
     secrets::delete(&key_account(KeyKind::SessionKey, name));
     secrets::delete(&key_account(KeyKind::Token, name));
-    app::forget(name);
+    app::forget(RowKind::SessionKey, name);
+    app::forget(RowKind::Token, name);
     Ok(fill(t().msg_removed, &[name]))
 }
 
@@ -290,7 +297,7 @@ fn set_hidden(name: &str, hidden: bool) -> Edit {
     }
     save(|doc| config::set_field(doc, "hidden_logins", (!list.is_empty()).then(|| json!(list))))?;
     if hidden {
-        app::forget(name);
+        app::forget(RowKind::ClaudeCode, name);
     }
     Ok(fill(if hidden { t().msg_hidden } else { t().msg_shown }, &[name]))
 }
@@ -390,6 +397,16 @@ mod tests {
         assert_eq!(config::load_config().hidden_logins, ["a@b.c"]);
         assert!(!apply(EditRequest::SetHidden { name: "a@b.c".into(), hidden: false }).error);
         assert!(config::load_config().hidden_logins.is_empty());
+
+        // A key may carry the name of a Claude Code login — the same account's email — even
+        // while that login is hidden; only another added account's name is taken.
+        assert!(!apply(EditRequest::SetHidden { name: "a@b.c".into(), hidden: true }).error);
+        let twin = apply(EditRequest::Rename { name: "work".into(), kind: RowKind::Token, to: "a@b.c".into() });
+        assert!(!twin.error, "{}", twin.text);
+        assert_eq!(secrets::read("token:a@b.c").as_deref(), Some("sk-ant-oat01-scratch"));
+        assert_eq!(config::load_config().hidden_logins, ["a@b.c"]);
+        assert!(!apply(EditRequest::Rename { name: "a@b.c".into(), kind: RowKind::Token, to: "work".into() }).error);
+        assert!(!apply(EditRequest::SetHidden { name: "a@b.c".into(), hidden: false }).error);
 
         // Removing takes the entry and its key, and keeps what this build does not model.
         assert!(!apply(EditRequest::Remove { name: "work".into() }).error);

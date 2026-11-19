@@ -36,6 +36,10 @@ pub struct OAuthAccount {
     pub token: String,
     #[serde(default, deserialize_with = "lenient")]
     pub keychain: bool,
+    /// The email of the token's account, when the token could read it as it was added. A
+    /// token for the account Claude Code is signed into is left out of the menu while it is.
+    #[serde(default, deserialize_with = "lenient")]
+    pub email: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -52,6 +56,11 @@ pub struct Config {
     /// `MOST_USED_CHOICE` for the fullest account, or an account's name.
     #[serde(default, deserialize_with = "lenient")]
     pub menu_bar_account: String,
+    /// The kind of the account `menu_bar_account` names, since a key added to the app may
+    /// share its name with a Claude Code login. Missing in a config an older build wrote:
+    /// then the name alone decides.
+    #[serde(default, deserialize_with = "lenient")]
+    pub menu_bar_account_kind: String,
     #[serde(default, deserialize_with = "lenient")]
     pub check_interval_minutes: i64,
     #[serde(default, deserialize_with = "lenient")]

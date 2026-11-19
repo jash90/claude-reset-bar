@@ -1,12 +1,12 @@
 [package]
 name = "claude-reset-bar"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "Claude usage limits in the menu bar / system tray, with a notification when a limit resets"
 license = "MIT"
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard", "x11", "wayland"] }
 keyring = "4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 png = "0.18"

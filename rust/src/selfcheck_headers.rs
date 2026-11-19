@@ -7,7 +7,7 @@ use chrono::{TimeZone, Utc};
 
 use crate::http::{api_error_message, model_is_refused, usage_from_headers, FetchError};
 use crate::i18n::{fill, t, LANGUAGES};
-use crate::model::to_reading;
+use crate::model::{to_reading, RowKind};
 use crate::secrets::{key_account, KeyKind};
 use crate::selfcheck::{check, headers};
 
@@ -20,7 +20,7 @@ pub fn header_readings() {
     ]);
     let usage = usage_from_headers(&weekly, "");
     check(usage.is_some(), "limit headers yield a reading");
-    let reading = to_reading("acc", usage.ok_or_else(String::new));
+    let reading = to_reading(RowKind::Token, "acc", usage.ok_or_else(String::new));
     check(
         reading.err.is_none() && reading.seven_day.is_some_and(|w| (w.pct - 16.0).abs() < 1e-9),
         "the fraction becomes a percentage",
@@ -46,7 +46,7 @@ pub fn header_readings() {
         ("anthropic-ratelimit-unified-7d_oi-status", "allowed"),
         ("anthropic-ratelimit-unified-reset", "1794704400"),
     ]);
-    let reading = to_reading("acc", usage_from_headers(&scoped, "Fable").ok_or_else(String::new));
+    let reading = to_reading(RowKind::Token, "acc", usage_from_headers(&scoped, "Fable").ok_or_else(String::new));
     check(
         reading.seven_day.is_some_and(|w| (w.pct - 24.0).abs() < 1e-9),
         "the scoped claim is not taken for the weekly window",
@@ -55,7 +55,7 @@ pub fn header_readings() {
         reading.models.len() == 1 && reading.models[0].label == "Fable" && (reading.models[0].pct - 21.0).abs() < 1e-9,
         "the scoped claim becomes the model's weekly cap",
     );
-    let unscoped = to_reading("acc", usage_from_headers(&scoped, "").ok_or_else(String::new));
+    let unscoped = to_reading(RowKind::Token, "acc", usage_from_headers(&scoped, "").ok_or_else(String::new));
     check(unscoped.models.is_empty(), "a probe to a model without a cap of its own names no model");
 
     check(

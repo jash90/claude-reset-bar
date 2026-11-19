@@ -11,11 +11,13 @@ use rayon::prelude::*;
 
 use crate::accounts::{self, EditRequest};
 use crate::config::{self, Account, Config};
-use crate::credentials::{claude_code_tokens, name_claude_code_logins, Login};
+use crate::credentials::{claude_code_tokens, name_claude_code_logins, shadowed_accounts, Login};
 use crate::format::{clock, pct};
 use crate::http::{self, FetchError};
 use crate::i18n::{self, fill, t, LANGUAGES};
-use crate::model::{detect_reset, merge_stale, to_reading, Reading, Stamp, UsageResponse, Window, WindowState};
+use crate::model::{
+    detect_reset, merge_stale, to_reading, AccountKey, Reading, RowKind, Stamp, UsageResponse, Window, WindowState,
+};
 use crate::secrets::{self, key_account, KeyKind};
 use crate::view::{self, View};
 use crate::window_host;
@@ -26,8 +28,9 @@ pub enum Command {
     Poll,
     OpenConfig,
     SetLanguage(usize),
-    /// Which account the menu bar figure follows; `None` for the default.
-    SetMenuBarAccount(Option<String>),
+    /// Which account the menu bar figure follows: `None` for the default, a kind only for
+    /// an account (not for the most-used choice).
+    SetMenuBarAccount(Option<(Option<RowKind>, String)>),
     /// Opens the accounts window, or brings it forward; optionally with the cursor in the
     /// form that adds an account.
     ShowAccounts { add_form: bool },
@@ -41,16 +44,19 @@ pub type ViewSink = Box<dyn Fn(View) + Send>;
 #[derive(Default)]
 struct State {
     readings: Vec<Reading>,
-    baselines: HashMap<String, HashMap<&'static str, WindowState>>,
-    fast_polled: HashMap<String, Stamp>,
+    baselines: HashMap<AccountKey, HashMap<&'static str, WindowState>>,
+    fast_polled: HashMap<AccountKey, Stamp>,
     /// The names of the Claude Code logins seen on the last poll.
     claude_code_names: Vec<String>,
     /// The name each token was last shown under, for a poll where its email cannot be
     /// fetched.
     token_names: HashMap<String, String>,
-    /// Accounts that dropped out of reach, keyed by name, keeping their last reading so
-    /// the row does not simply vanish. Memory only — a restart forgets them.
+    /// Claude Code logins that dropped out of reach, keyed by name, keeping their last
+    /// reading so the row does not simply vanish. Memory only — a restart forgets them.
     stale: HashMap<String, Reading>,
+    /// Added accounts left out of this poll because a Claude Code login shows the same
+    /// account, by name.
+    shadowed: HashSet<String>,
     /// Set once the first poll returns, so the menu can say "loading" until then.
     polled: bool,
 }
@@ -67,37 +73,53 @@ pub fn snapshot() -> (Vec<Reading>, Vec<String>) {
     with_state(|s| (s.readings.clone(), s.claude_code_names.clone()))
 }
 
-/// Forgets an account outright — a removed account should not linger as a snapshot.
-pub fn forget(name: &str) {
+/// The added accounts left out of the last poll as the same account as a Claude Code login.
+pub fn shadowed() -> HashSet<String> {
+    with_state(|s| s.shadowed.clone())
+}
+
+/// Forgets an account outright — a removed account should not linger as a snapshot. Only
+/// that kind's state goes: a login of the same name stays.
+pub fn forget(kind: RowKind, name: &str) {
+    let key = (kind, name.to_string());
     with_state(|s| {
-        s.readings.retain(|r| r.name != name);
-        s.claude_code_names.retain(|n| n != name);
-        s.baselines.remove(name);
-        s.fast_polled.remove(name);
-        s.stale.remove(name);
+        s.readings.retain(|r| r.key() != key);
+        s.baselines.remove(&key);
+        s.fast_polled.remove(&key);
+        if kind == RowKind::ClaudeCode {
+            s.claude_code_names.retain(|n| n != name);
+            s.stale.remove(name);
+        } else {
+            s.shadowed.remove(name);
+        }
     })
 }
 
 /// Drops what is remembered about an account's limit windows. Its key may now belong to a
 /// different account, so the old baseline cannot tell a reset from a switch.
-pub fn drop_baseline(name: &str) {
+pub fn drop_baseline(kind: RowKind, name: &str) {
+    let key = (kind, name.to_string());
     with_state(|s| {
-        s.baselines.remove(name);
-        s.fast_polled.remove(name);
+        s.baselines.remove(&key);
+        s.fast_polled.remove(&key);
     })
 }
 
-/// Carries an account's state over to its new name.
-pub fn rename_state(from: &str, to: &str) {
+/// Carries an added account's state over to its new name.
+pub fn rename_state(kind: RowKind, from: &str, to: &str) {
+    let (old, new) = ((kind, from.to_string()), (kind, to.to_string()));
     with_state(|s| {
-        if let Some(reading) = s.readings.iter_mut().find(|r| r.name == from) {
+        if let Some(reading) = s.readings.iter_mut().find(|r| r.key() == old) {
             reading.name = to.to_string();
         }
-        if let Some(baseline) = s.baselines.remove(from) {
-            s.baselines.insert(to.to_string(), baseline);
+        if let Some(baseline) = s.baselines.remove(&old) {
+            s.baselines.insert(new.clone(), baseline);
         }
-        if let Some(done) = s.fast_polled.remove(from) {
-            s.fast_polled.insert(to.to_string(), done);
+        if let Some(done) = s.fast_polled.remove(&old) {
+            s.fast_polled.insert(new, done);
+        }
+        if s.shadowed.remove(from) {
+            s.shadowed.insert(to.to_string());
         }
     })
 }
@@ -134,14 +156,15 @@ struct ResetNotice {
     body: String,
 }
 
-fn check_reset(state: &mut State, name: &str, key: &'static str, label: &str, w: Window) -> Option<ResetNotice> {
-    let windows = state.baselines.entry(name.to_string()).or_default();
+fn check_reset(state: &mut State, account: &AccountKey, key: &'static str, label: &str, w: Window) -> Option<ResetNotice> {
+    let name = &account.1;
+    let windows = state.baselines.entry(account.clone()).or_default();
     let prev = windows.get(key).copied();
     let (fired, next) = detect_reset(prev, w.resets_at, w.pct);
     windows.insert(key, next);
     let prev = prev.filter(|_| fired)?;
     Some(ResetNotice {
-        title: fill(t().reset_title, &[name]),
+        title: fill(t().reset_title, &[name.as_str()]),
         body: fill(t().reset_body, &[label, &pct(prev.utilization), &pct(w.pct), &clock(w.resets_at)]),
     })
 }
@@ -155,14 +178,15 @@ fn retire(state: &mut State, names: &[String]) {
         let snapshot = state
             .readings
             .iter()
-            .find(|r| &r.name == name && r.err.is_none() && r.last_seen.is_none())
+            .find(|r| r.kind == RowKind::ClaudeCode && &r.name == name && r.err.is_none() && r.last_seen.is_none())
             .cloned();
         if let Some(mut reading) = snapshot {
             reading.last_seen = Some(Utc::now());
             state.stale.insert(name.clone(), reading);
         }
-        state.baselines.remove(name);
-        state.fast_polled.remove(name);
+        let key = (RowKind::ClaudeCode, name.clone());
+        state.baselines.remove(&key);
+        state.fast_polled.remove(&key);
     }
 }
 
@@ -173,7 +197,7 @@ enum Job {
     Token { name: String, token: String },
     /// Known to fail before any request goes out: the account's key is not where the
     /// config says it is.
-    Failed { name: String, error: String },
+    Failed { kind: RowKind, name: String, error: String },
 }
 
 /// A job's reading, plus what it learned along the way.
@@ -185,19 +209,19 @@ struct Outcome {
     rate_limited: bool,
 }
 
-fn outcome(name: &str, usage: Result<UsageResponse, FetchError>) -> Outcome {
+fn outcome(kind: RowKind, name: &str, usage: Result<UsageResponse, FetchError>) -> Outcome {
     Outcome {
         rate_limited: matches!(usage, Err(FetchError::Status(429))),
-        reading: to_reading(name, usage.map_err(|e| e.to_string())),
+        reading: to_reading(kind, name, usage.map_err(|e| e.to_string())),
         discovered_org: None,
     }
 }
 
 fn run_job(job: &Job) -> Outcome {
     match job {
-        Job::Login(login) => outcome(&login.name, http::fetch_usage_oauth(&login.token)),
-        Job::Token { name, token } => outcome(name, http::fetch_usage_for_token(token)),
-        Job::Failed { name, error } => outcome(name, Err(FetchError::Other(error.clone()))),
+        Job::Login(login) => outcome(RowKind::ClaudeCode, &login.name, http::fetch_usage_oauth(&login.token)),
+        Job::Token { name, token } => outcome(RowKind::Token, name, http::fetch_usage_for_token(token)),
+        Job::Failed { kind, name, error } => outcome(*kind, name, Err(FetchError::Other(error.clone()))),
         Job::Session(account) => {
             let mut account = account.clone();
             let mut discovered_org = None;
@@ -207,10 +231,11 @@ fn run_job(job: &Job) -> Outcome {
                         discovered_org = Some((account.name.clone(), id.clone()));
                         account.org_id = id;
                     }
-                    Err(e) => return outcome(&account.name, Err(e)),
+                    Err(e) => return outcome(RowKind::SessionKey, &account.name, Err(e)),
                 }
             }
-            Outcome { discovered_org, ..outcome(&account.name, http::fetch_usage_session(&account)) }
+            let usage = http::fetch_usage_session(&account);
+            Outcome { discovered_org, ..outcome(RowKind::SessionKey, &account.name, usage) }
         }
     }
 }
@@ -224,20 +249,33 @@ fn stored_key(in_store: bool, kind: KeyKind, name: &str, in_config: &str) -> Res
     secrets::read(&key_account(kind, name)).ok_or_else(|| t().key_missing.to_string())
 }
 
-fn config_jobs(cfg: &Config) -> Vec<Job> {
-    let failed = |name: &str, error| Job::Failed { name: name.to_string(), error };
+/// The added accounts as (name, stored email) pairs, for `shadowed_accounts`. Anything not
+/// filled in is the skeleton written by ensure_config.
+fn added_accounts(cfg: &Config) -> Vec<(String, String)> {
+    let sessions = cfg.accounts.iter().filter(|a| !a.name.is_empty() && (a.keychain || !a.session_key.is_empty()));
+    let tokens = cfg.oauth_accounts.iter().filter(|a| !a.name.is_empty() && (a.keychain || !a.token.is_empty()));
+    sessions
+        .map(|a| (a.name.clone(), String::new()))
+        .chain(tokens.map(|a| (a.name.clone(), a.email.clone())))
+        .collect()
+}
+
+/// The jobs for the added accounts, leaving out the ones shadowed by a Claude Code login.
+fn config_jobs(cfg: &Config, shadowed: &HashSet<String>) -> Vec<Job> {
+    let failed = |kind, name: &str, error| Job::Failed { kind, name: name.to_string(), error };
+    let polled = |name: &String| !name.is_empty() && !shadowed.contains(name);
     let mut jobs = Vec::new();
     // Anything not filled in is the skeleton written by ensure_config.
-    for a in cfg.accounts.iter().filter(|a| !a.name.is_empty() && (a.keychain || !a.session_key.is_empty())) {
+    for a in cfg.accounts.iter().filter(|a| polled(&a.name) && (a.keychain || !a.session_key.is_empty())) {
         jobs.push(match stored_key(a.keychain, KeyKind::SessionKey, &a.name, &a.session_key) {
             Ok(session_key) => Job::Session(Account { session_key, ..a.clone() }),
-            Err(error) => failed(&a.name, error),
+            Err(error) => failed(RowKind::SessionKey, &a.name, error),
         });
     }
-    for a in cfg.oauth_accounts.iter().filter(|a| !a.name.is_empty() && (a.keychain || !a.token.is_empty())) {
+    for a in cfg.oauth_accounts.iter().filter(|a| polled(&a.name) && (a.keychain || !a.token.is_empty())) {
         jobs.push(match stored_key(a.keychain, KeyKind::Token, &a.name, &a.token) {
             Ok(token) => Job::Token { name: a.name.clone(), token },
-            Err(error) => failed(&a.name, error),
+            Err(error) => failed(RowKind::Token, &a.name, error),
         });
     }
     jobs
@@ -245,8 +283,7 @@ fn config_jobs(cfg: &Config) -> Vec<Job> {
 
 pub fn poll() {
     let cfg = accounts::move_keys_to_store(config::load_config());
-    let configured: HashSet<String> =
-        cfg.configured_names().into_iter().chain(cfg.hidden_logins.iter().cloned()).collect();
+    let hidden: HashSet<String> = cfg.hidden_logins.iter().cloned().collect();
 
     // Every Claude Code login — no configuration needed. The email is fetched on every poll
     // because /login swaps the account behind the same credentials, and the name keys the
@@ -254,21 +291,33 @@ pub fn poll() {
     let tokens = claude_code_tokens();
     let emails: Vec<String> = tokens.par_iter().map(|token| http::fetch_oauth_label(token)).collect();
 
+    // An added key for the account a visible login is on shows nothing the login does not.
+    let visible_emails: Vec<String> = emails.iter().filter(|e| !e.is_empty() && !hidden.contains(*e)).cloned().collect();
+    let shadowed = shadowed_accounts(&added_accounts(&cfg), &visible_emails);
+
     let logins = with_state(|state| {
         let logins =
-            name_claude_code_logins(&tokens, &emails, &state.token_names, &state.claude_code_names, &configured);
+            name_claude_code_logins(&tokens, &emails, &state.token_names, &state.claude_code_names, &hidden);
         state.token_names = logins.iter().map(|l| (l.token.clone(), l.name.clone())).collect();
         let current: Vec<String> = logins.iter().map(|l| l.name.clone()).collect();
         let gone: Vec<String> =
             state.claude_code_names.iter().filter(|n| !current.contains(n)).cloned().collect();
         retire(state, &gone);
         state.claude_code_names = current;
+        // A shadowed account's baseline would be stale by the time it comes back.
+        for name in &shadowed {
+            for kind in [RowKind::SessionKey, RowKind::Token] {
+                state.baselines.remove(&(kind, name.clone()));
+                state.fast_polled.remove(&(kind, name.clone()));
+            }
+        }
+        state.shadowed = shadowed.clone();
         logins
     });
 
     // Isolated from one another: an expired key on one account must not block the others.
     // The indexed collect keeps the rows in their display order.
-    let jobs: Vec<Job> = logins.into_iter().map(Job::Login).chain(config_jobs(&cfg)).collect();
+    let jobs: Vec<Job> = logins.into_iter().map(Job::Login).chain(config_jobs(&cfg, &shadowed)).collect();
     let outcomes: Vec<Outcome> = jobs.par_iter().map(run_job).collect();
 
     // Written one at a time, after the parallel part: two accounts must not race on the file.
@@ -284,7 +333,7 @@ pub fn poll() {
             .map(|o| {
                 // Rate limited: the last reading is minutes old at most and resets_at has
                 // not moved, so it stays on show until the next poll gets through.
-                let last = state.readings.iter().find(|r| r.name == o.reading.name);
+                let last = state.readings.iter().find(|r| r.key() == o.reading.key());
                 match last.filter(|r| o.rate_limited && r.err.is_none() && r.last_seen.is_none()) {
                     Some(last) => last.clone(),
                     None => o.reading,
@@ -299,10 +348,10 @@ pub fn poll() {
         let mut notices = Vec::new();
         for r in out.iter().filter(|r| r.err.is_none()) {
             if let Some(w) = r.five_hour {
-                notices.extend(check_reset(state, &r.name, "five_hour", t().five_hour_window, w));
+                notices.extend(check_reset(state, &r.key(), "five_hour", t().five_hour_window, w));
             }
             if let Some(w) = r.seven_day {
-                notices.extend(check_reset(state, &r.name, "seven_day", t().seven_day_window, w));
+                notices.extend(check_reset(state, &r.key(), "seven_day", t().seven_day_window, w));
             }
         }
         state.readings = merge_stale(out, &state.stale);
@@ -327,10 +376,10 @@ fn reset_is_due() -> bool {
             if r.err.is_some() || r.last_seen.is_some() || headline.resets_at > now {
                 continue;
             }
-            if state.fast_polled.get(&r.name) == Some(&headline.resets_at) {
+            if state.fast_polled.get(&r.key()) == Some(&headline.resets_at) {
                 continue;
             }
-            state.fast_polled.insert(r.name.clone(), headline.resets_at);
+            state.fast_polled.insert(r.key(), headline.resets_at);
             return true;
         }
         false
@@ -340,7 +389,9 @@ fn reset_is_due() -> bool {
 pub fn render() -> View {
     let (readings, logins, polled) =
         with_state(|s| (s.readings.clone(), s.claude_code_names.clone(), s.polled));
-    view::render(&readings, &logins, polled, &config::load_config().menu_bar_account)
+    let cfg = config::load_config();
+    let choice_kind = RowKind::from_config_value(&cfg.menu_bar_account_kind);
+    view::render(&readings, &logins, polled, &cfg.menu_bar_account, choice_kind)
 }
 
 fn report(what: &str, result: std::io::Result<()>) {
@@ -386,7 +437,9 @@ pub fn run_worker(commands: Receiver<Command>, show: ViewSink) {
             }
             Ok(Command::SetMenuBarAccount(choice)) => {
                 let saved = config::edit_config(|doc| {
-                    config::set_field(doc, "menu_bar_account", choice.clone().map(Into::into))
+                    let kind = choice.as_ref().and_then(|(kind, _)| *kind).map(|k| k.config_value().into());
+                    config::set_field(doc, "menu_bar_account", choice.as_ref().map(|(_, name)| name.as_str().into()));
+                    config::set_field(doc, "menu_bar_account_kind", kind);
                 });
                 report("save the menu bar account", saved);
                 refresh(&show);

@@ -50,7 +50,7 @@ Nothing leaves your machine beyond the requests to `api.anthropic.com` and `clau
 
 ## Which account the menu bar shows
 
-The figure next to the icon follows the account signed into Claude Code — the fuller of its two windows, with the time until it frees up once it reaches 100%. The **Menu bar shows** submenu switches it to another account or to the most used one. The choice is stored as `"menu_bar_account"` in the config (`"*most-used"` for the most used account; leave it out for the default), which is also how the portable build is set. A chosen account that cannot be read at the moment falls back to the Claude Code account, and with no Claude Code login the most used account stands in.
+The figure next to the icon follows the account signed into Claude Code and shows its weekly limit (the 5-hour window only when the API reports no weekly one), with the time until it frees up once it reaches 100%. In the menu, the accounts Claude Code is signed into come first, under a "Signed in" heading and a rule that sets them apart from the rest. The **Menu bar shows** submenu switches it to another account or to the most used one. The choice is stored as `"menu_bar_account"` in the config (`"*most-used"` for the most used account; leave it out for the default), with `"menu_bar_account_kind"` (`claude_code`, `token` or `session_key`) telling apart a key and a login of the same name, which is also how the portable build is set. A chosen account that cannot be read at the moment falls back to the Claude Code account, and with no Claude Code login the most used account stands in.
 
 ## Interface language
 
@@ -115,7 +115,7 @@ The config can also be edited by hand; the menu has an entry that opens it. It l
 
 `org_id` can be left out of a `sessionKey` entry: the app looks it up from the key on the next poll and write it into the file, leaving everything else in it as it was.
 
-An account added by key under the same name as a Claude Code login (its email) replaces that login's row instead of appearing twice. Under a different name, it shows up twice.
+An account added by key may carry the same name as a Claude Code login (its email). While Claude Code is signed into that account, the key is not polled and the menu shows the login only; the accounts window lists the key as the same account as the login. Once Claude Code is signed into another account, or the login is hidden, the key shows up in the menu with its own limits. A key under a different name always shows up as an account of its own (a token from `claude setup-token` cannot read its email, so its name is what tells).
 
 ## How reset detection works
 

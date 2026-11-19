@@ -8,14 +8,17 @@ use chrono::{Duration, TimeZone, Utc};
 use serde_json::Value;
 
 use crate::config::{parse_config, patch_org_id};
-use crate::credentials::{is_oauth_token, live_tokens, name_claude_code_logins, parse_credential, StoredCredential};
+use crate::credentials::{
+    is_oauth_token, live_tokens, name_claude_code_logins, parse_credential, shadowed_accounts, StoredCredential,
+};
 use crate::format::{bar, remaining, reset_line, window_line, BAR_CELLS};
 use crate::i18n::{fill, resolve_language, set_language, t, LANGUAGES};
 use crate::icon::{app_icon, draw_icon, encode_png, png_size, to_ico, ICON_COLOR, ICON_SIZE};
 use crate::model::{
-    detect_reset, menu_bar_reading, merge_stale, parse_iso, reset_counts, to_reading, Reading, ResetCount,
+    detect_reset, menu_bar_reading, merge_stale, parse_iso, reset_counts, to_reading, Reading, ResetCount, RowKind,
     UsageLimit, UsageResponse, UsageWindow, Window, MOST_USED_CHOICE,
 };
+use crate::view::{menu_bar_choices, reading_lines, title};
 
 pub fn check(cond: bool, what: &str) {
     if !cond {
@@ -230,8 +233,24 @@ fn configs_and_credentials() {
     );
     check(
         named.len() == 2 && named[0].name == "a@x" && named[1].name == "b@x",
-        "emails name logins, a known token keeps its name, duplicates and configured names are skipped",
+        "emails name logins, a known token keeps its name, duplicates and hidden logins are skipped",
     );
+
+    // A key added for the account a visible login is on is left out — matched by its name
+    // (a setup-token cannot read its email) or by the email stored when it was added.
+    let added = [
+        ("Me@X".to_string(), String::new()),
+        ("work".to_string(), "me@x".to_string()),
+        ("other".to_string(), "other@x".to_string()),
+        ("".to_string(), String::new()),
+    ];
+    let shadowed = shadowed_accounts(&added, &strings(&["me@x"]));
+    check(
+        shadowed.len() == 2 && shadowed.contains("Me@X") && shadowed.contains("work"),
+        "a key named by the login's email, or holding it, is the login's account",
+    );
+    check(shadowed_accounts(&added, &[]).is_empty(), "no visible login, nothing shadowed");
+    check(shadowed_accounts(&added, &strings(&[""])).is_empty(), "a login without an email shadows nothing");
     let kept = name_claude_code_logins(&strings(&["new"]), &strings(&[""]), &no_names, &strings(&["me@x"]), &nothing);
     check(kept[0].name == "me@x", "a single login whose email is unavailable keeps the previous name");
     let unnamed = name_claude_code_logins(&strings(&["t1", "t2"]), &strings(&["", ""]), &no_names, &[], &nothing);
@@ -283,7 +302,7 @@ fn payloads() {
     // Per-model weekly caps: read from the scoped entries in limits[], which is where the
     // API reports them now that seven_day_opus and seven_day_sonnet come back null.
     let scoped = scoped_payload();
-    let got = to_reading("acc", Ok(scoped.clone()));
+    let got = to_reading(RowKind::Token, "acc", Ok(scoped.clone()));
     check(got.err.is_none(), "a scoped payload decodes");
     check(got.active, "the session entry still sets the active flag");
     check(got.models.len() == 2, "both scoped models produce a row");
@@ -292,12 +311,12 @@ fn payloads() {
 
     // The legacy fields still work, and must not duplicate a scoped entry of the same name.
     let legacy = UsageResponse { seven_day_opus: win(77.0, ""), ..scoped.clone() };
-    let dedup = to_reading("acc", Ok(legacy));
+    let dedup = to_reading(RowKind::Token, "acc", Ok(legacy));
     check(dedup.models.len() == 2, "a model reported twice yields one row");
     check(dedup.models[1].label == "Opus" && dedup.models[1].pct == 77.0, "the legacy field wins when both are present");
 
     // An account reporting no per-model caps simply has no such rows.
-    let plain = to_reading(
+    let plain = to_reading(RowKind::Token,
         "acc",
         Ok(UsageResponse {
             five_hour: scoped.five_hour.clone(),
@@ -311,7 +330,7 @@ fn payloads() {
     // A window whose dedicated field went null is read from limits[] instead — the same
     // move the per-model caps already made, and the shape that left the app reporting an
     // unexpected response while Claude Code itself was fine.
-    let nulled = to_reading(
+    let nulled = to_reading(RowKind::Token,
         "acc",
         Ok(UsageResponse {
             five_hour: None,
@@ -344,7 +363,7 @@ fn payloads() {
             {"kind":"weekly_scoped","group":"weekly","percent":0,"scope":{"model":{"display_name":"Fable"}}}]}"#,
     );
     check(idle_payload.is_ok(), "the idle payload decodes");
-    let idle = to_reading("acc", idle_payload.map_err(|e| e.to_string()));
+    let idle = to_reading(RowKind::Token, "acc", idle_payload.map_err(|e| e.to_string()));
     check(idle.err.is_none(), "a missing 5-hour window does not fail the account");
     check(idle.five_hour.is_none(), "an idle 5-hour window is reported as absent, not as 0%");
     check(idle.seven_day.is_some_and(|w| w.pct == 58.0), "the weekly window still comes through");
@@ -360,11 +379,11 @@ fn payloads() {
 
     // Nothing to read anywhere is still an error rather than a row of zeros.
     check(
-        to_reading("acc", Ok(UsageResponse::default())).err.is_some(),
+        to_reading(RowKind::Token, "acc", Ok(UsageResponse::default())).err.is_some(),
         "an empty response reports failure, it does not invent a reading",
     );
     check(
-        to_reading("acc", Err("boom".into())).err.as_deref() == Some("boom"),
+        to_reading(RowKind::Token, "acc", Err("boom".into())).err.as_deref() == Some("boom"),
         "a failed request carries its message",
     );
 }
@@ -382,12 +401,12 @@ fn menu_bar_choice() {
         mk("cc@x", 59.0),
         mk("tok", 100.0),
         mk("low", 16.0),
-        Reading::failed("bad", "x"),
+        Reading::failed(RowKind::Token, "bad", "x"),
         Reading { last_seen: Some(at), ..mk("old", 95.0) },
     ];
     let cc = strings(&["cc@x"]);
     let figure = |choice: &str, logins: &[String], rs: &[Reading]| {
-        menu_bar_reading(choice, logins, rs).and_then(Reading::headline).map(|w| w.pct)
+        menu_bar_reading(choice, None, logins, rs).and_then(Reading::headline).map(|w| w.pct)
     };
     check(figure("", &cc, &rs) == Some(59.0), "the Claude Code login by default");
     check(figure(MOST_USED_CHOICE, &cc, &rs) == Some(100.0), "the fullest live account when asked for");
@@ -395,6 +414,51 @@ fn menu_bar_choice() {
     check(figure("bad", &cc, &rs) == Some(59.0), "a chosen account without a reading falls back");
     check(figure("", &[], &rs) == Some(100.0), "no Claude Code login: the fullest account stands in");
     check(figure("", &[], &rs[3..4]).is_none(), "nothing readable");
+
+    // A key and a login under one name are two accounts: the kind saved with the choice
+    // picks one, and the default follows the login even when the key comes first.
+    let twins = vec![Reading { kind: RowKind::Token, ..mk("cc@x", 30.0) }, mk("cc@x", 59.0)];
+    let pick = |choice: &str, kind| menu_bar_reading(choice, kind, &cc, &twins).and_then(Reading::headline).map(|w| w.pct);
+    check(pick("cc@x", Some(RowKind::Token)) == Some(30.0), "a choice saved with its kind picks that account");
+    check(pick("cc@x", Some(RowKind::ClaudeCode)) == Some(59.0), "the login of the same name");
+    check(pick("cc@x", None) == Some(30.0), "a choice an older build saved matches by name");
+    check(pick("", None) == Some(59.0), "the default follows the login, not a key of its name");
+    let login_only = &twins[1..];
+    let shadowed_pick = menu_bar_reading("cc@x", Some(RowKind::Token), &cc, login_only).and_then(Reading::headline);
+    check(shadowed_pick.map(|w| w.pct) == Some(59.0), "a chosen key left out gives way to the login of its name");
+    check(menu_bar_choices("cc@x", Some(RowKind::Token), login_only)[2].checked, "and the login carries the tick");
+    // The menu frames the signed-in account first, under a heading, then a rule, then the rest.
+    let lines = reading_lines(&twins);
+    let rule = lines.iter().position(|l| l.chars().all(|c| c == '─')).unwrap_or(0);
+    check(
+        lines[0].contains(t().signed_in_heading)
+            && lines[1].contains(&format!("cc@x · {}", t().type_claude_code))
+            && rule > 1
+            && lines[rule + 1].contains(&format!("cc@x · {}", t().type_token)),
+        "the signed-in account comes first, framed; rows sharing a name say their kind",
+    );
+    let alone = reading_lines(&rs[..1]);
+    check(
+        alone[1].ends_with("cc@x") && !alone.iter().any(|l| l.chars().all(|c| c == '─')),
+        "a name of its own stays as it is, and no rule closes a block nothing follows",
+    );
+    let key_only = [Reading { kind: RowKind::Token, ..mk("tok", 1.0) }];
+    check(!reading_lines(&key_only)[0].contains(t().signed_in_heading), "no heading without a login");
+
+    // The figure is the weekly limit, however full the 5-hour window is.
+    let busy = Reading {
+        five_hour: Some(Window { pct: 95.0, resets_at: at }),
+        seven_day: Some(Window { pct: 40.0, resets_at: at }),
+        ..Default::default()
+    };
+    check(title("", None, &cc, &[Reading { name: "cc@x".into(), ..busy }]).1 == 40.0, "the menu bar shows the weekly limit");
+    let no_week = Reading { name: "cc@x".into(), five_hour: Some(Window { pct: 12.0, resets_at: at }), ..Default::default() };
+    check(title("", None, &cc, &[no_week]).1 == 12.0, "the 5-hour window stands in when there is no weekly one");
+    let choices = menu_bar_choices("cc@x", Some(RowKind::Token), &twins);
+    check(
+        choices[2].value == Some((Some(RowKind::Token), "cc@x".into())) && choices[2].checked && !choices[3].checked,
+        "the menu offers both and ticks the one saved",
+    );
 
     let spent = Reading {
         five_hour: Some(Window { pct: 0.0, resets_at: at }),
@@ -438,7 +502,7 @@ fn limit_resets() {
     let odd: Result<UsageResponse, _> = serde_json::from_str(
         r#"{"seven_day":{"utilization":1,"resets_at":"2026-11-15T01:00:00+00:00"},"cedar_ember":"soon"}"#,
     );
-    let odd = to_reading("acc", odd.map_err(|e| e.to_string()));
+    let odd = to_reading(RowKind::Token, "acc", odd.map_err(|e| e.to_string()));
     check(
         odd.seven_day.is_some() && odd.resets.is_empty(),
         "an unreadable resets block does not cost the reading",
@@ -481,6 +545,11 @@ fn gauges_and_snapshots() {
     check(
         shadowed.len() == 2 && shadowed[1].name == "zoe@example.com",
         "a snapshot is skipped once the account is live again",
+    );
+    let key = Reading { kind: RowKind::Token, ..named("zoe@example.com") };
+    check(
+        merge_stale(vec![key], &stale).len() == 2,
+        "a key for the account a login has left takes over from the login's snapshot",
     );
     check(merge_stale(Vec::new(), &HashMap::new()).is_empty(), "no snapshots, no rows");
 }

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::i18n::t;
@@ -196,9 +196,47 @@ pub struct ModelWindow {
     pub pct: f64,
 }
 
+/// Where an account comes from. Together with the name it identifies the account: a key
+/// added to the app may carry the same name as a Claude Code login — the same email — and
+/// still be an account of its own, with its own state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RowKind {
+    #[default]
+    ClaudeCode,
+    SessionKey,
+    Token,
+}
+
+impl RowKind {
+    /// The value `menu_bar_account_kind` stores.
+    pub fn config_value(self) -> &'static str {
+        match self {
+            RowKind::ClaudeCode => "claude_code",
+            RowKind::SessionKey => "session_key",
+            RowKind::Token => "token",
+        }
+    }
+
+    pub fn from_config_value(value: &str) -> Option<Self> {
+        [RowKind::ClaudeCode, RowKind::SessionKey, RowKind::Token].into_iter().find(|k| k.config_value() == value)
+    }
+
+    pub fn type_text(self) -> &'static str {
+        match self {
+            RowKind::ClaudeCode => t().type_claude_code,
+            RowKind::SessionKey => t().type_session_key,
+            RowKind::Token => t().type_token,
+        }
+    }
+}
+
+/// What the state kept between polls is keyed by.
+pub type AccountKey = (RowKind, String);
+
 #[derive(Debug, Clone, Default)]
 pub struct Reading {
     pub name: String,
+    pub kind: RowKind,
     // None when the API reports no such window. A 5-hour window only exists while one is
     // running, and since 2026-11 the API answers an idle one with "five_hour": null and no
     // session entry in limits[] at all, so its absence is a normal state, not an error.
@@ -215,19 +253,28 @@ pub struct Reading {
 }
 
 impl Reading {
-    pub fn failed(name: &str, err: impl Into<String>) -> Self {
-        Reading { name: name.to_string(), err: Some(err.into()), ..Default::default() }
+    pub fn failed(kind: RowKind, name: &str, err: impl Into<String>) -> Self {
+        Reading { name: name.to_string(), kind, err: Some(err.into()), ..Default::default() }
     }
 
     /// The window that limits you right now: the fuller of the two. A spent weekly limit
-    /// blocks the account however empty the 5-hour window is. This is what the menu bar
-    /// figure shows.
+    /// blocks the account however empty the 5-hour window is.
     pub fn headline(&self) -> Option<Window> {
         match (self.five_hour, self.seven_day) {
             (None, week) => week,
             (session, None) => session,
             (Some(session), Some(week)) => Some(if week.pct > session.pct { week } else { session }),
         }
+    }
+
+    /// The window the menu bar figure shows: the weekly limit, or the 5-hour window when
+    /// the API reports no weekly one.
+    pub fn bar_window(&self) -> Option<Window> {
+        self.seven_day.or(self.five_hour)
+    }
+
+    pub fn key(&self) -> AccountKey {
+        (self.kind, self.name.clone())
     }
 
     fn is_live(&self) -> bool {
@@ -250,25 +297,26 @@ pub fn window_reading(w: Option<&UsageWindow>, limits: &[UsageLimit], kind: &str
     Some(Window { pct: pct?, resets_at: parse_iso(&stamp?)? })
 }
 
-pub fn to_reading(name: &str, usage: Result<UsageResponse, String>) -> Reading {
-    to_reading_at(name, usage, Utc::now())
+pub fn to_reading(kind: RowKind, name: &str, usage: Result<UsageResponse, String>) -> Reading {
+    to_reading_at(kind, name, usage, Utc::now())
 }
 
-pub fn to_reading_at(name: &str, usage: Result<UsageResponse, String>, now: Stamp) -> Reading {
+pub fn to_reading_at(kind: RowKind, name: &str, usage: Result<UsageResponse, String>, now: Stamp) -> Reading {
     let u = match usage {
         Ok(u) => u,
-        Err(e) => return Reading::failed(name, e),
+        Err(e) => return Reading::failed(kind, name, e),
     };
     // Each window is optional; the account only counts as unreadable when neither the
     // 5-hour nor the 7-day window can be found anywhere.
     let mut r = Reading {
         name: name.to_string(),
+        kind,
         five_hour: window_reading(u.five_hour.as_ref(), &u.limits, "session"),
         seven_day: window_reading(u.seven_day.as_ref(), &u.limits, "weekly_all"),
         ..Default::default()
     };
     if r.five_hour.is_none() && r.seven_day.is_none() {
-        return Reading::failed(name, t().shape_error);
+        return Reading::failed(kind, name, t().shape_error);
     }
     r.resets = reset_counts(u.cedar_ember.as_ref(), now);
     // Per-model weekly caps arrive two ways depending on the account. The dedicated fields
@@ -326,7 +374,9 @@ pub fn detect_reset(prev: Option<WindowState>, resets_at: Stamp, utilization: f6
 }
 
 /// Appends snapshots of unreachable accounts after the live rows, skipping any name a live
-/// row already covers. Sorted by name so the menu keeps a stable order.
+/// row already covers — whatever its kind: once Claude Code is signed into another account,
+/// a key added for the old one takes over from the old login's snapshot. Sorted by name so
+/// the menu keeps a stable order.
 pub fn merge_stale(mut live: Vec<Reading>, stale: &HashMap<String, Reading>) -> Vec<Reading> {
     let covered: HashSet<String> = live.iter().map(|r| r.name.clone()).collect();
     let mut names: Vec<&String> = stale.keys().filter(|n| !covered.contains(*n)).collect();
@@ -340,26 +390,35 @@ pub const MOST_USED_CHOICE: &str = "*most-used";
 
 /// Picks the reading the tray figure follows. By default that is the account signed into
 /// Claude Code. A chosen account wins while it has a live reading; otherwise, and when no
-/// Claude Code login is readable either, the fullest account stands in, so the figure
-/// never goes blank while some account can be read.
-pub fn menu_bar_reading<'a>(choice: &str, claude_code: &[String], rs: &'a [Reading]) -> Option<&'a Reading> {
-    let live = |name: &str| rs.iter().find(|r| r.name == name && r.is_live());
-    let pct = |r: &Reading| r.headline().map_or(0.0, |w| w.pct);
+/// Claude Code login is readable either, the account with the fullest weekly limit stands
+/// in, so the figure
+/// never goes blank while some account can be read. A choice saved without a kind — by an
+/// older build — matches by name alone.
+pub fn menu_bar_reading<'a>(
+    choice: &str,
+    choice_kind: Option<RowKind>,
+    claude_code: &[String],
+    rs: &'a [Reading],
+) -> Option<&'a Reading> {
+    let live = |name: &str, kind: Option<RowKind>| {
+        rs.iter().find(|r| r.name == name && kind.is_none_or(|k| r.kind == k) && r.is_live())
+    };
+    let pct = |r: &Reading| r.bar_window().map_or(0.0, |w| w.pct);
     let mut most_used: Option<&Reading> = None;
-    for r in rs {
-        if let Some(r) = live(&r.name) {
-            if most_used.map_or(true, |m| pct(r) > pct(m)) {
-                most_used = Some(r);
-            }
+    for r in rs.iter().filter(|r| r.is_live()) {
+        if most_used.map_or(true, |m| pct(r) > pct(m)) {
+            most_used = Some(r);
         }
     }
     if choice == MOST_USED_CHOICE {
         return most_used;
     }
+    // A chosen key that is left out as the login's account gives way to the login of its
+    // name — the same account.
     if !choice.is_empty() {
-        if let Some(r) = live(choice) {
+        if let Some(r) = live(choice, choice_kind).or_else(|| live(choice, None)) {
             return Some(r);
         }
     }
-    claude_code.iter().find_map(|name| live(name)).or(most_used)
+    claude_code.iter().find_map(|name| live(name, Some(RowKind::ClaudeCode))).or(most_used)
 }

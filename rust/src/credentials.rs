@@ -101,15 +101,16 @@ pub struct Login {
 }
 
 /// Names the logins found this poll. A login whose email could not be fetched keeps the
-/// name it had before; failing that it gets a numbered "Claude Code" name. A name the
-/// config already uses is skipped — that account is on screen already — and so is a second
-/// login into the same account.
+/// name it had before; failing that it gets a numbered "Claude Code" name. A login hidden
+/// from the menu is skipped, and so is a second login into the same account. A key added
+/// to the app under the same name does not hide a login: that key is the one left out of
+/// the menu (see `shadowed_tokens`).
 pub fn name_claude_code_logins(
     tokens: &[String],
     emails: &[String],
     known: &HashMap<String, String>,
     previous: &[String],
-    configured: &HashSet<String>,
+    hidden: &HashSet<String>,
 ) -> Vec<Login> {
     let mut out: Vec<Login> = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
@@ -126,12 +127,28 @@ pub fn name_claude_code_logins(
                 format!("Claude Code {}", i + 1)
             };
         }
-        if configured.contains(&name) || out.iter().any(|l| l.name == name) {
+        if hidden.contains(&name) || out.iter().any(|l| l.name == name) {
             continue;
         }
         out.push(Login { name, token: token.clone() });
     }
     out
+}
+
+/// The added accounts that belong to an account Claude Code is signed into right now, by
+/// name: those named by the login's email, or whose stored email is the login's. A token
+/// from `claude setup-token` cannot read its own email, so the name is what usually tells.
+/// They are not polled or shown in the menu while that lasts: the login already shows the
+/// same limits, and two rows would send two notifications for one reset. Only a login whose
+/// email came back this poll counts — one that is hidden, or whose token has expired,
+/// leaves the added key as the way to see the account.
+pub fn shadowed_accounts(added: &[(String, String)], login_emails: &[String]) -> HashSet<String> {
+    let same = |a: &str, b: &str| !a.is_empty() && a.eq_ignore_ascii_case(b);
+    added
+        .iter()
+        .filter(|(name, email)| login_emails.iter().any(|login| same(name, login) || same(email, login)))
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Tells a token Claude Code issues from a claude.ai sessionKey.
